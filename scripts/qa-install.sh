@@ -6,9 +6,14 @@ set -euo pipefail
 NEW="target/release/herdr-reviewr"
 MANIFEST="herdr-plugin.toml"
 
-# Locate the managed plugin install. Exactly one is expected.
+# Locate the managed plugin install. Exactly one is expected: herdr 0.9.5+ keeps the checkout in use
+# under github-installations, older herdr directly under github.
 shopt -s nullglob
-roots=("$HOME"/.config/herdr/plugins/github/persiyanov.reviewr-*)
+plugins="$HOME/.config/herdr/plugins"
+roots=("$plugins"/github/persiyanov.reviewr-*)
+for in_use in "$plugins"/github-installations/persiyanov.reviewr-*/*/.in-use; do
+  roots+=("$(dirname "$in_use")/checkout")
+done
 shopt -u nullglob
 [ ${#roots[@]} -eq 1 ] || {
   echo "qa-install: expected one installed plugin, found ${#roots[@]}:" >&2
