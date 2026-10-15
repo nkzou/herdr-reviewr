@@ -106,6 +106,8 @@ struct TabStash {
     visited: bool,
     /// This tab's deferred load that has not landed, as [`App::loading`].
     loading: Option<std::time::Instant>,
+    /// Whether this tab's tree still waits on its ignored entries.
+    ignored_pending: bool,
 }
 
 /// Where a switch's world build runs.
@@ -769,6 +771,8 @@ pub struct App {
     /// The active tab's deferred load that has not landed: the frame holds until this instant,
     /// then paints `loading…`.
     loading: Option<std::time::Instant>,
+    /// Whether the `All files` tree still waits on its ignored entries.
+    ignored_pending: bool,
     highlighter: Highlighter,
     /// The active palette every renderer paints from.
     palette: Palette,
@@ -938,6 +942,7 @@ impl App {
             tab_visited: false,
             world_load: WorldLoad::Inline,
             loading: None,
+            ignored_pending: false,
             highlighter: Highlighter::new(theme.syntax),
             palette: theme.palette,
             theme_name: theme.name,
@@ -1234,6 +1239,11 @@ impl App {
         Ok(())
     }
 
+    /// Whether the `All files` tree still waits on its ignored entries, which land behind it.
+    pub fn ignored_pending(&self) -> bool {
+        self.ignored_pending && self.tab == Tab::AllFiles && !self.loading()
+    }
+
     /// Whether the active file tab waits on a deferred load, so its list and diff are not shown.
     pub fn loading(&self) -> bool {
         self.loading.is_some() && self.tab.is_file_tab()
@@ -1293,6 +1303,7 @@ impl App {
         });
         self.changeset = snapshot.changeset;
         self.entries = snapshot.entries;
+        self.ignored_pending = snapshot.ignored_pending;
         self.adopt_branch_base(snapshot.branch_base);
         self.adopt_pick_status(snapshot.pick_status);
         self.rebuild_file_rows();
@@ -2865,6 +2876,7 @@ impl App {
         std::mem::swap(&mut self.comment_target, &mut self.stash.comment_target);
         std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
         std::mem::swap(&mut self.loading, &mut self.stash.loading);
+        std::mem::swap(&mut self.ignored_pending, &mut self.stash.ignored_pending);
     }
 
     /// Flip focus; a hidden navigator is shown and focused instead.

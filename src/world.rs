@@ -41,6 +41,8 @@ pub struct WorldSnapshot {
     pub head: Option<String>,
     /// The paths a path-limited build re-read; `None` for a full build, which re-read everything.
     pub touched: Option<BTreeSet<String>>,
+    /// `All files` lists no ignored entries yet: their walk is still running.
+    pub ignored_pending: bool,
 }
 
 /// What one build found the commit pick to be.
@@ -95,6 +97,10 @@ pub struct Parts {
     base: Option<((Option<String>, u64), BaseRead)>,
     /// The worktree as a tree, `last-turn`'s new end.
     snapshot: Option<String>,
+    /// Leave an unread ignored listing to a walk off the build, as the worker does.
+    defer_ignored: bool,
+    /// Bumped whenever the ignored listing is dropped, so a walk of a dropped one never lands.
+    ignored_epoch: u64,
 }
 
 /// What one base resolution found.
@@ -159,7 +165,10 @@ impl Parts {
     /// Hear what a refresh says moved: a full one moves everything.
     pub fn note(&mut self, refresh: &Refresh) {
         match refresh {
-            Refresh::Full => *self = Self::default(),
+            Refresh::Full => {
+                let (defer_ignored, ignored_epoch) = (self.defer_ignored, self.ignored_epoch + 1);
+                *self = Self { defer_ignored, ignored_epoch, ..Self::default() };
+            }
             Refresh::Paths { paths, index } => {
                 if paths.is_empty() && !index {
                     return;
@@ -227,19 +236,51 @@ pub fn build_with(input: &WorldInput, parts: &mut Parts) -> Result<WorldSnapshot
             pick_status: None,
             head: None,
             touched: None,
+            ignored_pending: false,
         });
     }
     // One read of HEAD serves the snapshot and the uncommitted diff's old end.
     let head = git::head_oid(&input.repo);
     let ScopeBuild { branch_base, pick_status, changeset } =
         scope_build(input, head.clone(), parts)?;
+    // A deferred walk leaves the ignored entries out, landing them when it finishes.
+    let ignored_pending =
+        input.tab == Tab::AllFiles && parts.defer_ignored && parts.ignored.listed.is_none();
     let entries = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
         Tab::AllFiles => all_files_entries(input, &changeset.files, parts)?,
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changeset.files.values().map(Entry::from_changed).collect(),
     };
-    Ok(WorldSnapshot { changeset, entries, branch_base, pick_status, head, touched: None })
+    Ok(WorldSnapshot {
+        changeset,
+        entries,
+        branch_base,
+        pick_status,
+        head,
+        touched: None,
+        ignored_pending,
+    })
+}
+
+/// `snapshot` with the ignored entries `ignored` lists, as a full build would list them.
+fn with_ignored(
+    mut snapshot: WorldSnapshot,
+    input: &WorldInput,
+    ignored: &[git::IgnoredEntry],
+) -> WorldSnapshot {
+    let present: HashSet<String> = snapshot.entries.iter().map(|e| e.path.clone()).collect();
+    for (path, is_dir) in ignored {
+        if !present.contains(path) {
+            let w = git::WorktreeEntry { path: path.clone(), ignored: true, is_dir: *is_dir };
+            let annotation = snapshot.changeset.files.get(path).cloned();
+            snapshot.entries.push(Entry::from_worktree(w, annotation));
+        }
+    }
+    snapshot.entries = load_toggled(snapshot.entries, &input.repo, &input.toggled_dirs);
+    snapshot.ignored_pending = false;
+    snapshot.touched = None;
+    snapshot
 }
 
 /// The active scope's changeset and, on `branch`, its base.
@@ -333,8 +374,12 @@ pub(crate) fn all_files_entries(
         Entry::from_worktree(w, annotation)
     };
     let untracked = parts.untracked(&input.repo)?.to_vec();
-    let ignored = parts.ignored(&input.repo)?;
-    let listed = git::all_files_given(&input.repo, &untracked, Some(ignored))?;
+    let ignored = if parts.defer_ignored && parts.ignored.listed.is_none() {
+        None
+    } else {
+        Some(parts.ignored(&input.repo)?)
+    };
+    let listed = git::all_files_given(&input.repo, &untracked, ignored)?;
     let entries: Vec<Entry> = listed.into_iter().map(&to_entry).collect();
     Ok(load_toggled(entries, &input.repo, &input.toggled_dirs))
 }
@@ -510,6 +555,7 @@ fn merge_paths(
         pick_status: last.pick_status.clone(),
         head: last.head.clone(),
         touched: Some(paths.clone()),
+        ignored_pending: last.ignored_pending,
     })
 }
 
@@ -607,6 +653,16 @@ pub struct WorldJob {
     pub switch: bool,
 }
 
+impl WorldJob {
+    /// This job folded into the `next` one: the newest input, every refresh, either flag.
+    fn coalesce(self, next: Self) -> Self {
+        let mut refresh = self.refresh;
+        refresh.absorb(next.refresh);
+        let (reveal, switch) = (self.reveal || next.reveal, self.switch || next.switch);
+        Self { reveal, refresh, switch, ..next }
+    }
+}
+
 /// A finished job; no snapshot on the `PR` tab.
 #[derive(Debug)]
 pub struct WorldCompletion {
@@ -632,16 +688,60 @@ pub fn spawn(
         .name("world".into())
         .spawn(move || {
             git::sweep_dead_copies(&repo);
-            let mut worker = Worker::default();
-            while let Ok(mut job) = rx.recv() {
-                while let Ok(next) = rx.try_recv() {
-                    let mut refresh = job.refresh;
-                    refresh.absorb(next.refresh);
-                    let (reveal, switch) = (job.reveal || next.reveal, job.switch || next.switch);
-                    job = WorldJob { reveal, refresh, switch, ..next };
+            // One inbox for jobs and finished walks, so the worker sleeps on both.
+            let (inbox, post) = std::sync::mpsc::channel();
+            let forward = inbox.clone();
+            std::thread::Builder::new()
+                .name("world-inbox".into())
+                .spawn(move || {
+                    while let Ok(mut job) = rx.recv() {
+                        // What already queued goes as one job, as the worker would coalesce it.
+                        while let Ok(next) = rx.try_recv() {
+                            job = job.coalesce(next);
+                        }
+                        if forward.send(Mail::Job(job)).is_err() {
+                            return;
+                        }
+                    }
+                    // The worker holds its own inbox for walks, so the end of jobs is mailed.
+                    let _ = forward.send(Mail::Closed);
+                })
+                .expect("spawn world inbox");
+            let mut worker = Worker { inbox: Some(inbox), ..Worker::default() };
+            worker.parts.defer_ignored = true;
+            while let Ok(mail) = post.recv() {
+                let mut job = match mail {
+                    Mail::Job(job) => job,
+                    Mail::Closed => break,
+                    Mail::Ignored(epoch, listed) => {
+                        let Some(done) = worker.land_ignored(epoch, listed) else { continue };
+                        if tx.send(done).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                while let Ok(next) = post.try_recv() {
+                    let next = match next {
+                        Mail::Job(next) => next,
+                        // The queued jobs run first; the next receive ends the loop.
+                        Mail::Closed => {
+                            if let Some(inbox) = &worker.inbox {
+                                let _ = inbox.send(Mail::Closed);
+                            }
+                            break;
+                        }
+                        // The job about to run reads it.
+                        Mail::Ignored(epoch, listed) => {
+                            worker.store_ignored(epoch, listed);
+                            continue;
+                        }
+                    };
+                    job = job.coalesce(next);
                 }
                 let started = std::time::Instant::now();
                 let snapshot = worker.refresh(&job.input, job.refresh.clone(), job.switch);
+                worker.last_generation = job.generation;
                 let done = WorldCompletion {
                     generation: job.generation,
                     input: job.input,
@@ -659,17 +759,119 @@ pub fn spawn(
         .expect("spawn world worker")
 }
 
+/// What reaches the worker: a job, a finished ignored walk and the epoch it read, or the end of jobs.
+enum Mail {
+    Job(WorldJob),
+    Ignored(u64, Result<Vec<git::IgnoredEntry>>),
+    Closed,
+}
+
 /// What the worker keeps between jobs: its last build, what the index staged when it ran, the
 /// parts full builds share, and what moved since the last build.
 #[derive(Default)]
 struct Worker {
     last: Option<(WorldInput, WorldSnapshot)>,
+    /// The job that built `last`, which a walk's follow-up lands as.
+    last_generation: u64,
     staged: Option<u64>,
     parts: Parts,
     owed: Refresh,
+    /// Where a walk mails its result; `None` walks inline.
+    inbox: Option<std::sync::mpsc::Sender<Mail>>,
+    /// The epoch of the walk running now.
+    walking: Option<u64>,
 }
 
 impl Worker {
+    /// Start the ignored walk off the worker, unless one for the current listing runs.
+    fn walk_ignored(&mut self, repo: &Path) {
+        let epoch = self.parts.ignored_epoch;
+        let Some(inbox) = self.inbox.clone().filter(|_| self.walking != Some(epoch)) else {
+            return;
+        };
+        self.walking = Some(epoch);
+        let repo = repo.to_path_buf();
+        let spawned = std::thread::Builder::new().name("world-ignored".into()).spawn(move || {
+            let _ = inbox.send(Mail::Ignored(epoch, git::ignored_listing(&repo, None)));
+        });
+        if spawned.is_err() {
+            self.walking = None;
+        }
+    }
+
+    /// Keep a finished walk's listing if nothing dropped it since; paths moved meanwhile stay owed.
+    fn store_ignored(&mut self, epoch: u64, listed: Result<Vec<git::IgnoredEntry>>) -> bool {
+        if self.walking == Some(epoch) {
+            self.walking = None;
+        }
+        match listed {
+            Ok(listed)
+                if epoch == self.parts.ignored_epoch && self.parts.ignored.listed.is_none() =>
+            {
+                self.parts.ignored.listed = Some(listed);
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                logln!("ignored walk failed: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Land a finished walk: the last `All files` build, ignored entries added, as a follow-up.
+    fn land_ignored(
+        &mut self,
+        epoch: u64,
+        listed: Result<Vec<git::IgnoredEntry>>,
+    ) -> Option<WorldCompletion> {
+        if !self.store_ignored(epoch, listed) {
+            return None;
+        }
+        let (input, last) = self.last.take()?;
+        if !last.ignored_pending {
+            self.last = Some((input, last));
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let ignored = match self.parts.ignored(&input.repo) {
+            Ok(ignored) => ignored.to_vec(),
+            Err(e) => {
+                logln!("ignored re-read failed: {e:#}");
+                self.last = Some((input, last));
+                return None;
+            }
+        };
+        let built = with_ignored(last, &input, &ignored);
+        self.last = Some((input.clone(), built.clone()));
+        Some(WorldCompletion {
+            generation: self.last_generation,
+            input,
+            reveal: false,
+            snapshot: Some(Ok(built)),
+            refresh: Refresh::default(),
+            switch: false,
+            took: started.elapsed(),
+        })
+    }
+
+    /// A pending build whose ignored listing is now known gets it; one still unknown starts the walk.
+    fn settle_ignored(
+        &mut self,
+        input: &WorldInput,
+        built: Result<WorldSnapshot>,
+    ) -> Result<WorldSnapshot> {
+        let built = built?;
+        if !built.ignored_pending {
+            return Ok(built);
+        }
+        if self.parts.ignored.listed.is_none() {
+            self.walk_ignored(&input.repo);
+            return Ok(built);
+        }
+        let ignored = self.parts.ignored(&input.repo)?.to_vec();
+        Ok(with_ignored(built, input, &ignored))
+    }
     /// Run one refresh: only what moved when the last build is of the same input, else in full.
     /// `None` when nothing needs re-reading, and on the `PR` tab.
     fn refresh(
@@ -714,12 +916,23 @@ impl Worker {
         {
             // A switch back to the last build's input, with nothing moved since, is that build.
             if paths.is_empty() {
-                return switch.then(|| Ok(WorldSnapshot { touched: None, ..last.clone() }));
+                if !switch {
+                    return None;
+                }
+                let again = Ok(WorldSnapshot { touched: None, ..last.clone() });
+                let built = self.settle_ignored(input, again);
+                if let Ok(built) = &built {
+                    self.last = Some((input.clone(), built.clone()));
+                }
+                return Some(built);
             }
             match rebuild_paths(input, last, paths) {
                 Some(Ok(built)) => {
-                    self.last = Some((input.clone(), built.clone()));
-                    return Some(Ok(built));
+                    let built = self.settle_ignored(input, Ok(built));
+                    if let Ok(built) = &built {
+                        self.last = Some((input.clone(), built.clone()));
+                    }
+                    return Some(built);
                 }
                 // A failed narrow read is retried at once as a full build.
                 Some(Err(e)) => logln!("path-limited refresh failed, rebuilding in full: {e:#}"),
@@ -727,7 +940,12 @@ impl Worker {
             }
         }
         let fingerprint = fingerprint.unwrap_or_else(|| git::staged_fingerprint(&input.repo).ok());
+        // The walk starts first, so it runs beside the build.
+        if input.tab == Tab::AllFiles && self.parts.ignored.listed.is_none() {
+            self.walk_ignored(&input.repo);
+        }
         let built = build_with(input, &mut self.parts);
+        let built = self.settle_ignored(input, built);
         match &built {
             Ok(built) => {
                 self.staged = fingerprint;

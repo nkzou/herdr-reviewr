@@ -158,3 +158,23 @@ fn a_scope_switch_in_all_files_defers_and_the_stash_waits_too() {
     land_world(&mut app);
     assert_eq!(paths(&app), ["a.rs", "b.rs"]);
 }
+
+#[test]
+fn a_tree_waiting_on_its_ignored_entries_says_so() {
+    let r = branched_repo();
+    let mut app = deferred_app(&r);
+    app.set_tab(Tab::AllFiles).unwrap();
+    let mut snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    snapshot.ignored_pending = true;
+    app.reconcile_world(snapshot);
+    assert!(app.ignored_pending());
+    assert!(screen(&app).contains("loading ignored…"));
+    // `Changes` never waits on ignored entries.
+    app.set_tab(Tab::Changes).unwrap();
+    land_world(&mut app);
+    assert!(!screen(&app).contains("loading ignored…"));
+    app.set_tab(Tab::AllFiles).unwrap();
+    assert!(app.ignored_pending(), "the stash keeps it until the tree lands again");
+    land_world(&mut app);
+    assert!(!app.ignored_pending());
+}

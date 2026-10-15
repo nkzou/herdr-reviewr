@@ -1494,7 +1494,9 @@ const DIR_DOT_RESERVE: usize = 2;
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let block = bordered("Files", app.focus == Focus::Files, p);
+    // The ignored entries land behind the tree, so the title says they are still coming.
+    let title = if app.ignored_pending() { "Files · loading ignored…" } else { "Files" };
+    let block = bordered(title, app.focus == Focus::Files, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

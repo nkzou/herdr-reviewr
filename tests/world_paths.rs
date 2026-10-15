@@ -52,7 +52,20 @@ impl Worker {
             switch,
         };
         self.jobs.send(job).unwrap();
-        let completion = self.done.recv().unwrap();
+        let mut completion = self.done.recv().unwrap();
+        // A build waiting on its ignored walk is followed by the build with them.
+        while completion
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.as_ref().is_ok_and(|s| s.ignored_pending))
+        {
+            let follow_up = self.done.recv().unwrap();
+            assert_eq!(
+                follow_up.generation, completion.generation,
+                "the follow-up lands as its job"
+            );
+            completion = follow_up;
+        }
         (completion.input, completion.snapshot.map(|s| s.expect("the build succeeds")))
     }
 }
@@ -459,4 +472,31 @@ fn all_files_reuses_the_ignored_listing_and_a_batch_rereads_under_it() {
     assert!(entries.contains(&"target".to_string()), "{entries:?}");
     assert!(entries.contains(&"build".to_string()), "{entries:?}");
     assert!(!entries.iter().any(|e| e.starts_with("build/")), "collapsed: {entries:?}");
+}
+
+/// An `All files` build lands before its ignored walk, and the walk lands as the same job.
+#[test]
+fn all_files_lands_before_its_ignored_walk_and_the_walk_follows() {
+    let r = fixture();
+    r.write("target/out.o", "x\n");
+    let mut worker = Worker::on(&r);
+    let input = input_for(&r, Scope::Uncommitted, Tab::AllFiles);
+    let job = WorldJob { generation: 1, input, reveal: true, refresh: Refresh::Full, switch: true };
+    worker.jobs.send(job).unwrap();
+    let first = worker.done.recv().unwrap();
+    let built = first.snapshot.unwrap().unwrap();
+    assert!(built.ignored_pending);
+    assert!(!listed(&built).contains(&"target".to_string()), "no ignored entry yet");
+    assert!(listed(&built).contains(&"a.txt".to_string()), "the tree itself is whole");
+    let follow_up = worker.done.recv().unwrap();
+    assert_eq!(follow_up.generation, 1);
+    assert!(!follow_up.reveal, "a follow-up moves no place state");
+    let built = follow_up.snapshot.unwrap().unwrap();
+    assert!(!built.ignored_pending);
+    assert!(listed(&built).contains(&"target".to_string()));
+    // Known now: the next switch lands whole at once.
+    worker.generation = 1;
+    let again = worker.switch(&input_for(&r, Scope::Branch, Tab::AllFiles), Refresh::default());
+    assert!(!again.ignored_pending);
+    assert!(listed(&again).contains(&"target".to_string()));
 }
