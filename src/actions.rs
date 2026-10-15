@@ -130,7 +130,7 @@ fn act(action: Action) -> Result<Option<String>, Stop> {
     let target = Target::read(event)?;
     let ws = target.ws.as_str();
     // The event gives way at once: a holder is the user's own action in the new workspace.
-    let bound = if action == Action::AutoOpen { Duration::ZERO } else { LOCK_BOUND };
+    let bound = if action == Action::AutoOpen { Duration::ZERO } else { shortened(LOCK_BOUND) };
     // Held through the close or open, so a concurrent action sees this one's effect.
     let _lock = action_lock(ws, bound)?;
 
@@ -163,6 +163,19 @@ const LOCK_BOUND: Duration = herdr::CALL_BOUND
     .saturating_mul(5)
     .saturating_add(VISIBLE_BOUND)
     .saturating_add(Duration::from_secs(3));
+
+/// `bound`, divided by `REVIEWR_BOUND_DIVISOR` in a debug build, so a test waits a bound out fast.
+fn shortened(bound: Duration) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(divisor) = std::env::var("REVIEWR_BOUND_DIVISOR")
+        .ok()
+        .and_then(|d| d.parse::<u32>().ok())
+        .filter(|d| *d > 0)
+    {
+        return bound / divisor;
+    }
+    bound
+}
 
 /// The pause between two lock attempts.
 const LOCK_POLL: Duration = Duration::from_millis(20);
@@ -405,7 +418,8 @@ enum Launch {
 
 /// Read pane `pane` until it runs reviewr, is gone, or [`VISIBLE_BOUND`] passes.
 fn launch(pane: &str) -> Launch {
-    let deadline = Instant::now() + VISIBLE_BOUND;
+    let bound = shortened(VISIBLE_BOUND);
+    let deadline = Instant::now() + bound;
     loop {
         match runs_review_ui(pane) {
             Ok(PaneRun::Review) => return Launch::Running,
@@ -413,7 +427,7 @@ fn launch(pane: &str) -> Launch {
             _ => {}
         }
         if Instant::now() >= deadline {
-            logln!("opened pane {pane} not seen as reviewr after {VISIBLE_BOUND:?}");
+            logln!("opened pane {pane} not seen as reviewr after {bound:?}");
             return Launch::Unseen;
         }
         thread::sleep(VISIBLE_POLL);

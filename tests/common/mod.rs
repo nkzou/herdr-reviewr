@@ -54,6 +54,8 @@ impl Repo {
         repo.git(&["init", "-q", "-b", "main"]);
         // Pin `init.defaultBranch` so the machine's global config never steers a test.
         repo.git(&["config", "init.defaultBranch", "no-such-default"]);
+        // A global fsmonitor would start a daemon per test repo, through reviewr's own git calls too.
+        repo.git(&["config", "core.fsmonitor", "false"]);
         repo
     }
 
@@ -67,7 +69,13 @@ impl Repo {
 
     /// [`Self::git`] with extra environment, such as a pinned committer date.
     pub fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        // No global hooks, signing, or index features steer a test repo; Windows keeps its system
+        // config, whose `core.autocrlf` the suite exercises.
+        if cfg!(unix) {
+            command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        }
+        let out = command
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
             .env("GIT_COMMITTER_NAME", "Test")

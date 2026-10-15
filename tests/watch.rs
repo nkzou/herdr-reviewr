@@ -5,7 +5,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use common::Repo;
@@ -16,16 +16,42 @@ use herdr_reviewr::watch::{Batch, GitChange, Watch, WatchEvent};
 /// How long nothing must arrive before a burst counts as over.
 const QUIET: Duration = Duration::from_millis(400);
 
-/// One watcher at a time: macOS refuses a fourth live `FSEvents` stream in one process, a ceiling
-/// only the test binary meets.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+/// Live watchers at once: macOS refuses a fourth live `FSEvents` stream in one process, a ceiling
+/// only the test binary meets. One watcher holds one stream.
+const STREAMS: usize = if cfg!(target_os = "macos") { 3 } else { usize::MAX };
+
+/// How many watchers are live, and the wait for a free slot.
+static LIVE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// One of [`STREAMS`] slots, held while a watcher lives.
+struct Slot;
+
+impl Slot {
+    fn take() -> Self {
+        let (live, freed) = &LIVE;
+        let live = live.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut live =
+            freed.wait_while(live, |n| *n >= STREAMS).unwrap_or_else(PoisonError::into_inner);
+        *live += 1;
+        Self
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let (live, freed) = &LIVE;
+        *live.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        freed.notify_one();
+    }
+}
 
 struct Watched {
     watch: Watch,
     rx: Receiver<WatchEvent>,
     /// The paths each write reported to turn tracking named.
     wrote: Arc<Mutex<Vec<String>>>,
-    _turn: MutexGuard<'static, ()>,
+    // Declared last, so the slot frees after the watcher's stream stops.
+    _slot: Slot,
 }
 
 impl Watched {
@@ -38,7 +64,7 @@ impl Watched {
     }
 
     fn start_at(root: &std::path::Path, config: Option<&std::path::Path>) -> Self {
-        let turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = Slot::take();
         let (tx, rx) = channel(&Waker::detached());
         let wrote = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&wrote);
@@ -48,7 +74,7 @@ impl Watched {
             }
         });
         let watch = Watch::start(root, config, tx, Some(turns));
-        let watched = Self { watch, rx, wrote, _turn: turn };
+        let watched = Self { watch, rx, wrote, _slot: slot };
         // A stream starts live some time after `start`: probe until a write arrives, then drain.
         let probe = root.join(".watch-probe");
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -520,7 +546,7 @@ fn a_tracked_file_whose_ignored_folder_is_gone_leaves_the_watcher_running() {
 
 #[test]
 fn a_repository_whose_git_dir_does_not_resolve_is_unavailable_not_a_plain_folder() {
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _slot = Slot::take();
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join(".git"), "gitdir: /nowhere/at/all\n").unwrap();
     let (tx, rx) = channel(&Waker::detached());
@@ -686,7 +712,7 @@ fn a_branch_delete_and_pack_refs_remove_ref_folders_and_the_watch_survives() {
 
 #[test]
 fn a_watcher_that_cannot_start_restarts_and_asks_for_everything() {
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _slot = Slot::take();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("later");
     let (tx, rx) = channel(&Waker::detached());
@@ -722,7 +748,7 @@ fn a_watcher_that_cannot_start_restarts_and_asks_for_everything() {
 
 #[test]
 fn a_hidden_pane_restarts_no_watcher_until_it_is_shown() {
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _slot = Slot::take();
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("later");
     let (tx, rx) = channel(&Waker::detached());
@@ -744,7 +770,7 @@ fn a_hidden_pane_restarts_no_watcher_until_it_is_shown() {
 #[test]
 #[ignore = "needs fs.inotify.max_user_watches lowered below this repository's folder count"]
 fn a_watcher_out_of_inotify_watches_reports_itself_unavailable() {
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _slot = Slot::take();
     let r = repo_with(&["a.txt"]);
     let (tx, rx) = channel(&Waker::detached());
     let _watch = Watch::start(r.path(), None, tx, None);

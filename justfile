@@ -16,10 +16,16 @@ fmt-check:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
-# run the test suite, cut off from the herdr it may run inside: a test that reaches `herdr`
-# gets a binary that refuses and no socket, never a live agent pane
+# isolated: no live herdr (a refusing binary, no socket), no machine git config (fsmonitor, hooks)
+# run the test suite, isolated
 test:
-    env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false cargo test --all-features
+    {{isolated}} cargo test --all-features
+
+# run the test suite under cargo-nextest (`brew install cargo-nextest`), each test its own process
+test-fast:
+    {{isolated}} cargo nextest run --all-features
+
+isolated := "env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1"
 
 # build (debug)
 build:

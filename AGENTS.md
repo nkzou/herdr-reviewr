@@ -6,7 +6,8 @@ herdr-reviewr is a Rust TUI (ratatui) code-review pane: it runs in a [herdr](htt
 
 ## Commands
 
-- `just test` — full test suite, with the herdr environment stripped so no test can reach a live agent pane. Inside herdr, run a single test the same way: `env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false cargo test <name>` (unit tests live beside the code, integration tests in `tests/`: `cargo test --test app_flow <name>`).
+- `just test` — full test suite, with the herdr environment stripped so no test can reach a live agent pane, and the machine's git config cut off (a global fsmonitor, hooks, or commit signing makes each test git call slow or hang). Run a single test the same way: `env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 cargo test <name>` (unit tests live beside the code, integration tests in `tests/`: `cargo test --test app_flow <name>`).
+- `just test-fast` — the same suite under cargo-nextest (`brew install cargo-nextest`): each test in its own process, all binaries at once, about 50s instead of 2 minutes.
 - `just lint` — clippy with warnings as errors. `just fmt` / `just fmt-check` — rustfmt.
 - `just ci` — what CI's unix job runs (fmt-check, lint, test, release build, and the idle check: `scripts/idle_check.py` proves an idle or hidden pane wakes for nothing and starts no process). The Windows jobs run on CI only: dispatch them on a branch with `gh workflow run ci.yml --ref <branch>`.
 - `just qa-install` — put a local build into the user's real herdr panes. See "QA install" below before using it.

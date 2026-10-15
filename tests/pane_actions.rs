@@ -1035,7 +1035,7 @@ fn an_open_whose_pane_never_reads_as_reviewr_succeeds_after_the_bound_and_says_s
     fs::write(dir.path().join("opened-empty-reads"), "1000000").unwrap();
 
     let started = Instant::now();
-    let output = run_open(dir.path());
+    let output = shortened(with_context("open", dir.path(), &repo_context())).output().unwrap();
     let elapsed = started.elapsed();
 
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1043,8 +1043,10 @@ fn an_open_whose_pane_never_reads_as_reviewr_succeeds_after_the_bound_and_says_s
         stdout(&output),
         "reviewr: opened w1:p9 (split) in workspace-1, not yet seen running\n"
     );
-    assert!(elapsed >= Duration::from_millis(5900), "returned before the bound: {elapsed:?}");
-    assert!(elapsed < Duration::from_secs(15), "the wait is bounded: {elapsed:?}");
+    let bound = Duration::from_secs(6) / BOUND_DIVISOR;
+    let floor = bound.saturating_sub(Duration::from_millis(100));
+    assert!(elapsed >= floor, "returned before the bound: {elapsed:?}");
+    assert!(elapsed < bound + Duration::from_secs(9), "the wait is bounded: {elapsed:?}");
     assert!(opened_pane_reads(dir.path()) > 1, "{}", herdr_calls(dir.path()));
 }
 
@@ -1078,6 +1080,15 @@ fn hold_lock(dir: &Path, ws: &str) -> fs::File {
 }
 
 /// Start `mode` with a focused pane in this crate's repo, its output captured.
+/// What a debug build divides its lock and visibility bounds by under [`shortened`].
+const BOUND_DIVISOR: u32 = if cfg!(debug_assertions) { 10 } else { 1 };
+
+/// `command` with its bounds shortened, so a test waits one out fast; a release build ignores it.
+fn shortened(mut command: Command) -> Command {
+    command.env("REVIEWR_BOUND_DIVISOR", BOUND_DIVISOR.to_string());
+    command
+}
+
 fn start(mode: &str, dir: &Path) -> Child {
     with_context(mode, dir, &repo_context())
         .stdout(Stdio::piped())
@@ -1138,20 +1149,28 @@ fn an_explicit_action_refuses_once_the_lock_stays_held_past_the_bound() {
     let _lock = hold_lock(dir.path(), "workspace-1");
 
     let started = Instant::now();
-    let children = ["toggle", "open", "close"].map(|mode| (mode, start(mode, dir.path())));
+    let spawn = |mode| {
+        let mut command = shortened(with_context(mode, dir.path(), &repo_context()));
+        command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let children = ["toggle", "open", "close"].map(|mode| (mode, spawn(mode)));
+    let bound = Duration::from_secs(49) / BOUND_DIVISOR;
     for (mode, child) in children {
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(1), "{mode}");
         assert_eq!(
             stderr(&output),
-            "reviewr: another reviewr action in workspace-1 is still running after 49s\n",
+            format!(
+                "reviewr: another reviewr action in workspace-1 is still running after {bound:?}\n"
+            ),
             "{mode}"
         );
         assert!(output.stdout.is_empty(), "{mode}");
     }
     let elapsed = started.elapsed();
 
-    assert!(elapsed >= Duration::from_millis(48500), "refused before the bound: {elapsed:?}");
+    let floor = bound.saturating_sub(Duration::from_millis(500));
+    assert!(elapsed >= floor, "refused before the bound: {elapsed:?}");
     assert!(herdr_calls(dir.path()).is_empty(), "{}", herdr_calls(dir.path()));
 }
 
