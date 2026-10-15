@@ -4647,6 +4647,7 @@ fn completion_for(app: &App, generation: u64) -> herdr_reviewr::world::WorldComp
         reveal: false,
         snapshot: Some(Ok(snapshot)),
         refresh: herdr_reviewr::world::Refresh::Full,
+        switch: false,
         took: std::time::Duration::ZERO,
     }
 }
@@ -4906,8 +4907,13 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     newer.scope = Scope::Branch;
     // Both jobs queue before the worker starts, so the coalescing path is deterministic.
     let full = herdr_reviewr::world::Refresh::Full;
-    let job =
-        |generation, input, reveal| WorldJob { generation, input, reveal, refresh: full.clone() };
+    let job = |generation, input, reveal| WorldJob {
+        generation,
+        input,
+        reveal,
+        refresh: full.clone(),
+        switch: false,
+    };
     job_tx.send(job(1, input, true)).unwrap();
     job_tx.send(job(2, newer, false)).unwrap();
     let worker = world::spawn(dir.path().to_path_buf(), job_rx, res_tx);

@@ -224,7 +224,7 @@ fn run_editor(
             } else {
                 format!("editor exited with {status}")
             };
-            app.request_world_refresh(false);
+            app.request_reread();
             app.refresh_commanded = true;
         }
         Err(e) => app.status = format!("editor failed: {e}"),
@@ -700,7 +700,10 @@ pub fn land_world_completion(
         }
         Some(Err(e)) => {
             app.status = format!("refresh failed: {e}");
-            Landing::Failed(completion.refresh)
+            // A switch's view is still owed, so its retry builds whole.
+            let owed =
+                if completion.switch { crate::world::Refresh::Full } else { completion.refresh };
+            Landing::Failed(owed)
         }
         None => Landing::Landed,
     }
@@ -1124,7 +1127,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 let input = app.world_input();
                 world_live = LiveJob {
                     generation: world_live.generation.wrapping_add(1),
-                    full: request.refresh.is_full(),
+                    // A switch builds in full, so it re-reads whatever an older job owed.
+                    full: request.refresh.is_full() || request.switch,
                     reveal: request.reveal,
                     running: Some(Instant::now()),
                     // The `PR` tab builds nothing.
@@ -1135,6 +1139,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     input,
                     reveal: request.reveal,
                     refresh: request.refresh,
+                    switch: request.switch,
                 };
                 logln!("refresh {:?} background={}", job.refresh, request.background);
                 pacer.on_dispatched(request.background);
@@ -1904,7 +1909,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         match action {
             K::Quit => app.request_quit(),
             K::Refresh => {
-                app.request_world_refresh(false);
+                app.request_reread();
                 app.refresh_commanded = true;
             }
             K::TabChanges => app.set_tab(crate::app::Tab::Changes)?,

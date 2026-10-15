@@ -68,7 +68,7 @@ fn a_deferred_scope_switch_holds_then_lands_whole() {
     assert_eq!(paths(&app), ["b.rs"]);
     assert!(app.loading());
     assert!(app.load_hold().is_some_and(|left| left <= SWITCH_HOLD));
-    assert!(app.world_request.as_ref().is_some_and(|r| r.reveal && r.refresh.is_full()));
+    assert!(app.world_request.as_ref().is_some_and(|r| r.reveal && r.switch));
     land_world(&mut app);
     assert!(!app.loading());
     assert_eq!(paths(&app), ["a.rs", "b.rs"]);

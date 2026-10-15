@@ -86,8 +86,138 @@ pub struct ScopeBuild {
     pub changeset: Changeset,
 }
 
+/// What full builds share across inputs, each part current with every refresh the worker heard.
+#[derive(Debug, Default)]
+pub struct Parts {
+    untracked: Part<String>,
+    ignored: Part<git::IgnoredEntry>,
+    /// The base resolution and its merge-base, keyed by the `--base` flag and the pick epoch.
+    base: Option<((Option<String>, u64), BaseRead)>,
+    /// The worktree as a tree, `last-turn`'s new end.
+    snapshot: Option<String>,
+}
+
+/// What one base resolution found.
+#[derive(Clone, Debug)]
+struct BaseRead {
+    status: git::BaseStatus,
+    merge_base: Option<String>,
+}
+
+/// A listing read once, and the paths that moved since, re-read under those paths when next asked.
+#[derive(Debug)]
+struct Part<T> {
+    listed: Option<Vec<T>>,
+    moved: BTreeSet<String>,
+}
+
+impl<T> Default for Part<T> {
+    fn default() -> Self {
+        Self { listed: None, moved: BTreeSet::new() }
+    }
+}
+
+/// A listed item's path.
+trait Listed {
+    fn path(&self) -> &str;
+}
+
+impl Listed for String {
+    fn path(&self) -> &str {
+        self
+    }
+}
+
+impl Listed for git::IgnoredEntry {
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<T: Listed> Part<T> {
+    /// The listing: whole when never read, else re-read under what moved; past the cap, whole.
+    fn get(
+        &mut self,
+        whole: impl FnOnce() -> Result<Vec<T>>,
+        under: impl FnOnce(&[String]) -> Result<Vec<T>>,
+    ) -> Result<&[T]> {
+        let moved: Vec<String> = std::mem::take(&mut self.moved).into_iter().collect();
+        let listed = match self.listed.take() {
+            Some(listed) if moved.is_empty() => listed,
+            Some(listed) if git::fits_command_line(&moved) => {
+                let fresh = under(&moved)?;
+                let kept = listed.into_iter().filter(|t| !git::covered(&moved, t.path()));
+                kept.chain(fresh).collect()
+            }
+            _ => whole()?,
+        };
+        Ok(self.listed.insert(listed))
+    }
+}
+
+impl Parts {
+    /// Hear what a refresh says moved: a full one moves everything.
+    pub fn note(&mut self, refresh: &Refresh) {
+        match refresh {
+            Refresh::Full => *self = Self::default(),
+            Refresh::Paths { paths, index } => {
+                if paths.is_empty() && !index {
+                    return;
+                }
+                self.untracked.moved.extend(paths.iter().cloned());
+                self.ignored.moved.extend(paths.iter().cloned());
+                // A stage moves what is untracked, at paths no batch names.
+                if *index {
+                    self.untracked = Part::default();
+                }
+                self.snapshot = None;
+            }
+        }
+    }
+
+    fn untracked(&mut self, repo: &Path) -> Result<&[String]> {
+        self.untracked.get(|| git::untracked_files(repo), |paths| git::untracked_under(repo, paths))
+    }
+
+    fn ignored(&mut self, repo: &Path) -> Result<&[git::IgnoredEntry]> {
+        self.ignored.get(
+            || git::ignored_listing(repo, None),
+            |paths| git::ignored_listing(repo, Some(paths)),
+        )
+    }
+
+    fn base(&mut self, input: &WorldInput) -> Result<BaseRead> {
+        let key = (input.base.clone(), input.base_epoch);
+        if let Some((of, read)) = &self.base
+            && *of == key
+        {
+            return Ok(read.clone());
+        }
+        // A resolve failure fails the build, keeping the stale frame.
+        let resolution = git::resolve_base(&input.repo, input.base.as_deref())?;
+        let merge_base =
+            resolution.status.winner.as_ref().and_then(|w| git::merge_base(&input.repo, w.oid()));
+        let read = BaseRead { status: resolution.status, merge_base };
+        self.base = Some((key, read.clone()));
+        Ok(read)
+    }
+
+    fn snapshot(&mut self, repo: &Path) -> Result<String> {
+        if let Some(tree) = &self.snapshot {
+            return Ok(tree.clone());
+        }
+        let tree = git::snapshot_worktree(repo)?;
+        Ok(self.snapshot.insert(tree).clone())
+    }
+}
+
 /// Build the snapshot for `input`; the changeset is built on every tab.
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
+    build_with(input, &mut Parts::default())
+}
+
+/// [`build`], reading through `parts`, which a refresh keeps current.
+pub fn build_with(input: &WorldInput, parts: &mut Parts) -> Result<WorldSnapshot> {
     // Outside a repo, paint the quiet empty state, not an error every refresh.
     if !git::is_repo(&input.repo) {
         return Ok(WorldSnapshot {
@@ -101,10 +231,11 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
     }
     // One read of HEAD serves the snapshot and the uncommitted diff's old end.
     let head = git::head_oid(&input.repo);
-    let ScopeBuild { branch_base, pick_status, changeset } = scope_build(input, head.clone())?;
+    let ScopeBuild { branch_base, pick_status, changeset } =
+        scope_build(input, head.clone(), parts)?;
     let entries = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
-        Tab::AllFiles => all_files_entries(input, &changeset.files)?,
+        Tab::AllFiles => all_files_entries(input, &changeset.files, parts)?,
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changeset.files.values().map(Entry::from_changed).collect(),
     };
@@ -116,36 +247,30 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
     if !git::is_repo(&input.repo) {
         return Ok(ScopeBuild::default());
     }
-    scope_build(input, git::head_oid(&input.repo))
+    scope_build(input, git::head_oid(&input.repo), &mut Parts::default())
 }
 
 /// [`build_changed`] against `head`, as the caller read it, inside a repo.
-fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
+fn scope_build(input: &WorldInput, head: Option<String>, parts: &mut Parts) -> Result<ScopeBuild> {
     match input.scope {
         Scope::LastTurn => match input.turn_baseline.as_deref() {
             Some(t) => {
-                let now = git::snapshot_worktree(&input.repo)?;
-                at_ends(&input.repo, DiffEnds { old: t.to_string(), new: Some(now) })
+                let now = parts.snapshot(&input.repo)?;
+                at_ends(&input.repo, DiffEnds { old: t.to_string(), new: Some(now) }, parts)
             }
             None => Ok(ScopeBuild::default()),
         },
         Scope::Uncommitted => {
             let base = git::diff_base(head);
-            at_ends(&input.repo, DiffEnds { old: base, new: None })
+            at_ends(&input.repo, DiffEnds { old: base, new: None }, parts)
         }
         Scope::Branch => {
-            // A resolve failure fails the build, keeping the stale frame.
-            let resolution = git::resolve_base(&input.repo, input.base.as_deref())?;
-            let merge_base = resolution
-                .status
-                .winner
-                .as_ref()
-                .and_then(|w| git::merge_base(&input.repo, w.oid()));
-            let build = match merge_base {
-                Some(base) => at_ends(&input.repo, DiffEnds { old: base, new: None })?,
+            let base = parts.base(input)?;
+            let build = match base.merge_base {
+                Some(old) => at_ends(&input.repo, DiffEnds { old, new: None }, parts)?,
                 None => ScopeBuild::default(),
             };
-            Ok(ScopeBuild { branch_base: resolution.status, ..build })
+            Ok(ScopeBuild { branch_base: base.status, ..build })
         }
         Scope::Commits => {
             // A tag without a pick builds the empty changeset.
@@ -156,9 +281,9 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
 }
 
 /// The changeset between `ends`, carried beside them: the ends a file's diff reads are its input.
-fn at_ends(repo: &Path, ends: DiffEnds) -> Result<ScopeBuild> {
+fn at_ends(repo: &Path, ends: DiffEnds, parts: &mut Parts) -> Result<ScopeBuild> {
     let changed = match &ends.new {
-        None => git::changed_from(repo, &ends.old)?,
+        None => git::changed_from_given(repo, &ends.old, parts.untracked(repo)?)?,
         Some(new) => git::changed_between(repo, &ends.old, new)?,
     };
     let files = changed.into_iter().map(|f| (f.path.clone(), f)).collect();
@@ -186,7 +311,8 @@ fn build_pick(repo: &Path, pick: &CommitPick) -> Result<ScopeBuild> {
     }
     let subject = git::commit_subject(repo, &pick.newest).unwrap_or_default();
     let count = git::run_length_from(repo, &old, &pick.oldest, &pick.newest).unwrap_or(0);
-    let at = at_ends(repo, DiffEnds { old, new: Some(pick.newest.clone()) })?;
+    let at =
+        at_ends(repo, DiffEnds { old, new: Some(pick.newest.clone()) }, &mut Parts::default())?;
     // The oldest is an ancestor of the newest, so one reachability check covers the run.
     let verdict = if git::is_reachable(repo, &pick.newest) {
         PickVerdict::Live
@@ -200,25 +326,58 @@ fn build_pick(repo: &Path, pick: &CommitPick) -> Result<ScopeBuild> {
 pub(crate) fn all_files_entries(
     input: &WorldInput,
     changed: &BTreeMap<String, ChangedFile>,
+    parts: &mut Parts,
 ) -> Result<Vec<Entry>> {
     let to_entry = |w: git::WorktreeEntry| {
         let annotation = changed.get(&w.path).cloned();
         Entry::from_worktree(w, annotation)
     };
-    let mut entries: Vec<Entry> = git::all_files(&input.repo)?.into_iter().map(&to_entry).collect();
+    let untracked = parts.untracked(&input.repo)?.to_vec();
+    let ignored = parts.ignored(&input.repo)?;
+    let listed = git::all_files_given(&input.repo, &untracked, Some(ignored))?;
+    let entries: Vec<Entry> = listed.into_iter().map(&to_entry).collect();
+    Ok(load_toggled(entries, &input.repo, &input.toggled_dirs))
+}
+
+/// `entries` with each expanded ignored directory's children loaded and each collapsed one's
+/// dropped, read from disk; sorted by path, which a path-limited rebuild merges into in one pass.
+pub(crate) fn load_toggled(
+    mut entries: Vec<Entry>,
+    repo: &Path,
+    toggled: &HashSet<String>,
+) -> Vec<Entry> {
+    let ignored_dirs: HashSet<String> =
+        entries.iter().filter(|e| e.is_dir && e.ignored).map(|e| e.path.clone()).collect();
+    // A loaded child goes with any collapsed ignored directory above it.
+    let collapsed_above = |path: &str| {
+        let mut at = path;
+        while let Some((parent, _)) = at.rsplit_once('/') {
+            if ignored_dirs.contains(parent) && !toggled.contains(parent) {
+                return true;
+            }
+            at = parent;
+        }
+        false
+    };
+    entries.retain(|e| !e.ignored || !collapsed_above(&e.path));
+    let present: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let has_children = |dir: &str| {
+        let prefix = format!("{dir}/");
+        present.iter().any(|p| p.starts_with(&prefix))
+    };
     let mut i = 0;
     while i < entries.len() {
-        if entries[i].is_dir && input.toggled_dirs.contains(&entries[i].path) {
-            let path = entries[i].path.clone();
-            let children = git::list_ignored_dir(&input.repo, &path).into_iter().map(&to_entry);
-            entries.extend(children);
+        let e = &entries[i];
+        if e.is_dir && e.ignored && toggled.contains(&e.path) && !has_children(&e.path) {
+            let path = e.path.clone();
+            let children = git::list_ignored_dir(repo, &path);
+            entries.extend(children.into_iter().map(|w| Entry::from_worktree(w, None)));
         }
         i += 1;
     }
-    // Sorted by path, which a path-limited rebuild merges into in one pass.
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries.dedup_by(|a, b| a.path == b.path);
-    Ok(entries)
+    entries
 }
 
 /// What a narrow re-read must also cover so git pairs renames as a full build would: both sides
@@ -432,6 +591,8 @@ pub struct WorldRequest {
     pub refresh: Refresh,
     /// Only the pacer asked for it: it spends the budget. The reviewer's work never does.
     pub background: bool,
+    /// The reviewer switched what the view shows: build it, though nothing moved.
+    pub switch: bool,
 }
 
 /// One refresh request; the completion echoes its tag.
@@ -442,6 +603,8 @@ pub struct WorldJob {
     /// Whether the result re-reveals the cursor: a user's switch does, a background one never.
     pub reveal: bool,
     pub refresh: Refresh,
+    /// The input changed under a switch: it builds even when nothing moved.
+    pub switch: bool,
 }
 
 /// A finished job; no snapshot on the `PR` tab.
@@ -453,6 +616,8 @@ pub struct WorldCompletion {
     pub snapshot: Option<Result<WorldSnapshot>>,
     /// What the job re-read, so a failure can retry exactly that.
     pub refresh: Refresh,
+    /// Whether a switch asked for it, so a failure retries it whole.
+    pub switch: bool,
     /// How long the build took: the pacing budget's measure, which bounds its git's CPU.
     pub took: std::time::Duration,
 }
@@ -472,20 +637,18 @@ pub fn spawn(
                 while let Ok(next) = rx.try_recv() {
                     let mut refresh = job.refresh;
                     refresh.absorb(next.refresh);
-                    job = WorldJob { reveal: job.reveal || next.reveal, refresh, ..next };
+                    let (reveal, switch) = (job.reveal || next.reveal, job.switch || next.switch);
+                    job = WorldJob { reveal, refresh, switch, ..next };
                 }
                 let started = std::time::Instant::now();
-                let snapshot = if job.input.tab.is_file_tab() {
-                    worker.refresh(&job.input, job.refresh.clone())
-                } else {
-                    None
-                };
+                let snapshot = worker.refresh(&job.input, job.refresh.clone(), job.switch);
                 let done = WorldCompletion {
                     generation: job.generation,
                     input: job.input,
                     reveal: job.reveal,
                     snapshot,
                     refresh: job.refresh,
+                    switch: job.switch,
                     took: started.elapsed(),
                 };
                 if tx.send(done).is_err() {
@@ -496,26 +659,41 @@ pub fn spawn(
         .expect("spawn world worker")
 }
 
-/// What the worker keeps between jobs: its last build, and what the index staged when it ran.
+/// What the worker keeps between jobs: its last build, what the index staged when it ran, the
+/// parts full builds share, and what moved since the last build.
 #[derive(Default)]
 struct Worker {
     last: Option<(WorldInput, WorldSnapshot)>,
     staged: Option<u64>,
+    parts: Parts,
+    owed: Refresh,
 }
 
 impl Worker {
-    /// Run one refresh: only its paths when the last build is of the same input, else in full.
-    /// `None` when nothing needs re-reading.
+    /// Run one refresh: only what moved when the last build is of the same input, else in full.
+    /// `None` when nothing needs re-reading, and on the `PR` tab.
     fn refresh(
         &mut self,
         input: &WorldInput,
-        mut refresh: Refresh,
+        refresh: Refresh,
+        switch: bool,
     ) -> Option<Result<WorldSnapshot>> {
-        // A pick reads committed trees: on `Changes`, a worktree or index change moves nothing in it.
-        let pick_only = input.scope == Scope::Commits && input.tab == Tab::Changes;
-        if refresh.is_empty() || (pick_only && !refresh.is_full()) {
+        // Heard on every tab, so a build after a stretch on `PR` still reads what moved.
+        self.parts.note(&refresh);
+        self.owed.absorb(refresh);
+        if !input.tab.is_file_tab() {
             return None;
         }
+        // A pick reads committed trees: on `Changes`, a worktree or index change moves nothing in it.
+        let pick_only = input.scope == Scope::Commits && input.tab == Tab::Changes;
+        let same = self.last.as_ref().is_some_and(|(of, _)| of == input);
+        if pick_only && same && !self.owed.is_full() {
+            self.owed = Refresh::default();
+        }
+        if !switch && self.owed.is_empty() {
+            return None;
+        }
+        let mut refresh = std::mem::take(&mut self.owed);
         // Read before any build, so a stage landing during it reads as new next time.
         let mut fingerprint = None;
         if let Refresh::Paths { index: true, .. } = refresh {
@@ -534,8 +712,9 @@ impl Worker {
             && let Refresh::Paths { paths, .. } = &refresh
             && !paths.iter().any(in_expanded)
         {
+            // A switch back to the last build's input, with nothing moved since, is that build.
             if paths.is_empty() {
-                return None;
+                return switch.then(|| Ok(WorldSnapshot { touched: None, ..last.clone() }));
             }
             match rebuild_paths(input, last, paths) {
                 Some(Ok(built)) => {
@@ -548,7 +727,7 @@ impl Worker {
             }
         }
         let fingerprint = fingerprint.unwrap_or_else(|| git::staged_fingerprint(&input.repo).ok());
-        let built = build(input);
+        let built = build_with(input, &mut self.parts);
         match &built {
             Ok(built) => {
                 self.staged = fingerprint;

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use herdr_reviewr::app::Tab;
 use herdr_reviewr::model::Scope;
-use herdr_reviewr::world::{WorldInput, build};
+use herdr_reviewr::world::{Parts, WorldInput, build, build_with};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -18,16 +18,7 @@ fn main() {
         (Tab::Changes, Scope::Branch),
         (Tab::AllFiles, Scope::Uncommitted),
     ] {
-        let input = WorldInput {
-            repo: repo.clone(),
-            tab,
-            scope,
-            base: None,
-            base_epoch: 0,
-            turn_baseline: None,
-            commit_pick: None,
-            toggled_dirs: HashSet::new(),
-        };
+        let input = input_for(&repo, tab, scope);
         let mut times: Vec<f64> = (0..runs)
             .map(|_| {
                 let t = Instant::now();
@@ -39,9 +30,37 @@ fn main() {
         let first = times[0];
         times.sort_by(f64::total_cmp);
         let name = format!("{tab:?}/{scope:?}");
-        println!("{name:<24} first {first:>8.0}ms   median {:>8.0}ms", times[runs / 2]);
+        println!("{name:<32} first {first:>8.0}ms   median {:>8.0}ms", times[runs / 2]);
+    }
+    // Switches through the parts the worker shares, nothing moved between them.
+    let mut parts = Parts::default();
+    for (tab, scope) in [
+        (Tab::Changes, Scope::Uncommitted),
+        (Tab::Changes, Scope::Branch),
+        (Tab::AllFiles, Scope::Branch),
+        (Tab::AllFiles, Scope::Uncommitted),
+        (Tab::Changes, Scope::Uncommitted),
+    ] {
+        let input = input_for(&repo, tab, scope);
+        let t = Instant::now();
+        std::hint::black_box(build_with(&input, &mut parts).expect("build"));
+        let name = format!("switch {tab:?}/{scope:?}");
+        println!("{name:<32} {:>8.0}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
     let t = Instant::now();
     herdr_reviewr::git::snapshot_worktree(&repo).expect("snapshot");
-    println!("{:<24} once  {:>8.0}ms", "snapshot_worktree", t.elapsed().as_secs_f64() * 1000.0);
+    println!("{:<32} once  {:>8.0}ms", "snapshot_worktree", t.elapsed().as_secs_f64() * 1000.0);
+}
+
+fn input_for(repo: &std::path::Path, tab: Tab, scope: Scope) -> WorldInput {
+    WorldInput {
+        repo: repo.to_path_buf(),
+        tab,
+        scope,
+        base: None,
+        base_epoch: 0,
+        turn_baseline: None,
+        commit_pick: None,
+        toggled_dirs: HashSet::new(),
+    }
 }

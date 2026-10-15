@@ -1952,12 +1952,20 @@ impl App {
         self.herdr.on_screen
     }
 
-    /// Queue a world refresh; `reveal` is for user-initiated switches only.
+    /// Queue a build of what the view now shows; `reveal` is for user-initiated switches only.
     pub fn request_world_refresh(&mut self, reveal: bool) {
         let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
         request.reveal |= reveal;
         request.background = false;
-        request.refresh.absorb(crate::world::Refresh::Full);
+        request.switch = true;
+    }
+
+    /// Queue a build that reads everything again: `r`, or an editor that may have written.
+    pub fn request_reread(&mut self) {
+        self.request_world_refresh(false);
+        if let Some(request) = self.world_request.as_mut() {
+            request.refresh.absorb(crate::world::Refresh::Full);
+        }
     }
 
     /// Snap the diff view back to the top, clearing any pending selection.
@@ -3143,12 +3151,10 @@ impl App {
 
     /// Rebuild the tree after a directory's expansion changed, keeping the cursor in range.
     fn apply_dir_change(&mut self) {
-        // An expanded ignored directory loads its children first.
-        if self.tab == Tab::AllFiles
-            && let Ok(entries) =
-                crate::world::all_files_entries(&self.world_input(), &self.changeset.files)
-        {
-            self.entries = entries;
+        // An expanded ignored directory loads its children from disk; a collapsed one drops them.
+        if self.tab == Tab::AllFiles {
+            let entries = std::mem::take(&mut self.entries);
+            self.entries = crate::world::load_toggled(entries, &self.repo, &self.toggled_dirs);
         }
         self.rebuild_file_rows();
         self.file_cursor = self.file_cursor.min(self.file_rows.len().saturating_sub(1));

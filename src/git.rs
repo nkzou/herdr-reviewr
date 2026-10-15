@@ -1710,6 +1710,12 @@ fn expand_untracked(repo: &Path, listed: Vec<String>) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// The untracked files under `paths`, by one narrow walk.
+pub fn untracked_under(repo: &Path, paths: &[String]) -> Result<Vec<String>> {
+    let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+    Ok(nul_list(&git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?))
+}
+
 /// Every untracked file, as `ls-files --others --exclude-standard` lists them, in one fast status.
 pub fn untracked_files(repo: &Path) -> Result<Vec<String>> {
     let status = parse_status(&git(repo, &STATUS_ARGS)?);
@@ -2033,8 +2039,18 @@ pub fn diff_base(head: Option<String>) -> String {
 
 /// The changeset from `base` to the worktree, untracked files included.
 pub fn changed_from(repo: &Path, base: &str) -> Result<Vec<ChangedFile>> {
+    let untracked = untracked_files(repo)?;
+    changed_from_given(repo, base, &untracked)
+}
+
+/// [`changed_from`] with the untracked files already listed, as [`untracked_files`] lists them.
+pub fn changed_from_given(
+    repo: &Path,
+    base: &str,
+    untracked: &[String],
+) -> Result<Vec<ChangedFile>> {
     let out = IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[base])))?;
-    assemble(repo, &out, true, None)
+    assemble(repo, &out, Others::Given(untracked))
 }
 
 /// [`changed_from`] limited to `paths`, each a file or a directory.
@@ -2042,12 +2058,12 @@ pub fn changed_from_in(repo: &Path, base: &str, paths: &[String]) -> Result<Vec<
     let specs = literal_pathspecs(paths);
     let args = with_pathspecs(diff_args(&[base]), &specs);
     let out = IndexCopy::with(repo, |index| index.git(repo, &args))?;
-    assemble(repo, &out, true, Some(paths))
+    assemble(repo, &out, Others::Under(paths))
 }
 
 /// The changeset between two trees: `commits`, and `last-turn` against its snapshot.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
-    assemble(repo, &git(repo, &diff_args(&[old, new]))?, false, None)
+    assemble(repo, &git(repo, &diff_args(&[old, new]))?, Others::None)
 }
 
 /// [`changed_between`] limited to `paths`.
@@ -2059,7 +2075,7 @@ pub fn changed_between_in(
 ) -> Result<Vec<ChangedFile>> {
     let specs = literal_pathspecs(paths);
     let out = git(repo, &with_pathspecs(diff_args(&[old, new]), &specs))?;
-    assemble(repo, &out, false, Some(paths))
+    assemble(repo, &out, Others::Trees(paths))
 }
 
 /// One `git diff` per changeset: raw records, then line counts.
@@ -2221,36 +2237,29 @@ pub struct WorktreeEntry {
 
 /// Every worktree entry, sorted; an ignored directory collapses to one placeholder.
 pub fn all_files(repo: &Path) -> Result<Vec<WorktreeEntry>> {
-    all_files_listed(repo, &[])
+    let untracked = untracked_files(repo)?;
+    let ignored = ignored_listing(repo, None)?;
+    all_files_given(repo, &untracked, Some(&ignored))
 }
 
-/// [`all_files`] limited to `paths`.
-pub fn all_files_in(repo: &Path, paths: &[String]) -> Result<Vec<WorktreeEntry>> {
-    all_files_listed(repo, &literal_pathspecs(paths))
+/// [`all_files`] with the untracked and ignored entries already listed; `ignored` `None` lists none.
+pub fn all_files_given(
+    repo: &Path,
+    untracked: &[String],
+    ignored: Option<&[IgnoredEntry]>,
+) -> Result<Vec<WorktreeEntry>> {
+    let mut listed = nul_list(&git(repo, &["ls-files", "--cached", "-z"])?);
+    listed.extend(untracked.iter().cloned());
+    let ignored = ignored.unwrap_or_default().iter().cloned();
+    Ok(merge_listing(listed, ignored))
 }
 
-/// The worktree's entries under `specs`, or all of them when there are none.
-fn all_files_listed(repo: &Path, specs: &[String]) -> Result<Vec<WorktreeEntry>> {
-    let limit = |args: Vec<&'static str>| -> Vec<&str> {
-        if specs.is_empty() { args } else { with_pathspecs(args, specs) }
-    };
-    // Tracked from the index, untracked by the same listing `changed_from` uses.
-    let listed = if specs.is_empty() {
-        let mut listed = nul_list(&git(repo, &["ls-files", "--cached", "-z"])?);
-        listed.extend(untracked_files(repo)?);
-        listed
-    } else {
-        let args = vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"];
-        nul_list(&git(repo, &limit(args))?)
-    };
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in listed {
-        if seen.insert(path.clone()) {
-            out.push(WorktreeEntry { path, ignored: false, is_dir: false });
-        }
-    }
-    let ignored = limit(vec![
+/// An ignored path and whether it is a directory, which collapses to one placeholder.
+pub type IgnoredEntry = (String, bool);
+
+/// The ignored entries, each ignored directory pruned at its top; under `paths` only, when given.
+pub fn ignored_listing(repo: &Path, paths: Option<&[String]>) -> Result<Vec<IgnoredEntry>> {
+    let args = vec![
         "ls-files",
         "--others",
         "--ignored",
@@ -2258,14 +2267,41 @@ fn all_files_listed(repo: &Path, specs: &[String]) -> Result<Vec<WorktreeEntry>>
         "--directory",
         "--no-empty-directory",
         "-z",
-    ]);
-    for (path, is_dir) in ignored_entries(repo, &ignored)? {
+    ];
+    let specs = literal_pathspecs(paths.unwrap_or_default());
+    match paths {
+        Some(_) => ignored_entries(repo, &with_pathspecs(args, &specs)),
+        None => ignored_entries(repo, &args),
+    }
+}
+
+/// Listed paths first, then ignored entries not already listed, sorted by path.
+fn merge_listing(
+    listed: Vec<String>,
+    ignored: impl Iterator<Item = IgnoredEntry>,
+) -> Vec<WorktreeEntry> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in listed {
+        if seen.insert(path.clone()) {
+            out.push(WorktreeEntry { path, ignored: false, is_dir: false });
+        }
+    }
+    for (path, is_dir) in ignored {
         if seen.insert(path.clone()) {
             out.push(WorktreeEntry { path, ignored: true, is_dir });
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    out
+}
+
+/// [`all_files`] limited to `paths`.
+pub fn all_files_in(repo: &Path, paths: &[String]) -> Result<Vec<WorktreeEntry>> {
+    let args = vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"];
+    let listed = nul_list(&git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?);
+    let ignored = ignored_listing(repo, Some(paths))?;
+    Ok(merge_listing(listed, ignored.into_iter()))
 }
 
 /// The ignored entries, pruned at each ignored directory instead of walking inside it.
@@ -2294,14 +2330,27 @@ pub fn list_ignored_dir(repo: &Path, dir: &str) -> Vec<WorktreeEntry> {
     out
 }
 
+/// Which untracked files a changeset appends.
+#[derive(Clone, Copy)]
+enum Others<'a> {
+    /// A diff between trees, whole: none.
+    None,
+    /// A diff between trees, limited to these paths: none.
+    Trees(&'a [String]),
+    /// A worktree diff, whole: these, already listed.
+    Given(&'a [String]),
+    /// A worktree diff limited to these paths: the untracked files under them.
+    Under(&'a [String]),
+}
+
 /// The sorted changeset from one [`diff_args`] run, untracked files appended for a worktree diff.
-/// With `paths`, untracked files are listed under them only, and their counts merge into the cache.
-fn assemble(
-    repo: &Path,
-    out: &str,
-    worktree: bool,
-    paths: Option<&[String]>,
-) -> Result<Vec<ChangedFile>> {
+/// A path-limited read lists untracked files under its paths only, and their counts merge into the cache.
+fn assemble(repo: &Path, out: &str, others: Others<'_>) -> Result<Vec<ChangedFile>> {
+    let worktree = matches!(others, Others::Given(_) | Others::Under(_));
+    let paths = match others {
+        Others::Trees(paths) | Others::Under(paths) => Some(paths),
+        Others::None | Others::Given(_) => None,
+    };
     let (rows, numstat) = parse_raw(out);
     let counts = parse_numstat(numstat);
     let blobs: Vec<&str> = rows
@@ -2333,13 +2382,10 @@ fn assemble(
 
     if worktree {
         // Untracked files are additions, by the same listing `all_files` uses; a narrow walk is cheap.
-        let others = match paths {
-            None => untracked_files(repo)?,
-            Some(paths) => {
-                let specs = literal_pathspecs(paths);
-                let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
-                nul_list(&git(repo, &with_pathspecs(args, &specs))?)
-            }
+        let others = match others {
+            Others::Given(listed) => listed.to_vec(),
+            Others::Under(paths) => untracked_under(repo, paths)?,
+            Others::None | Others::Trees(_) => Vec::new(),
         };
         let new_paths: Vec<&str> =
             others.iter().map(String::as_str).filter(|p| !seen.contains(*p)).collect();

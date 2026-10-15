@@ -29,9 +29,28 @@ impl Worker {
     /// One job through the worker: the input it built for and its snapshot, `None` when nothing
     /// needed re-reading.
     fn run(&mut self, input: &WorldInput, refresh: Refresh) -> (WorldInput, Option<WorldSnapshot>) {
+        self.send(input, refresh, false)
+    }
+
+    /// One switch through the worker: `refresh` is what moved since the last job.
+    fn switch(&mut self, input: &WorldInput, refresh: Refresh) -> WorldSnapshot {
+        self.send(input, refresh, true).1.expect("a switch builds")
+    }
+
+    fn send(
+        &mut self,
+        input: &WorldInput,
+        refresh: Refresh,
+        switch: bool,
+    ) -> (WorldInput, Option<WorldSnapshot>) {
         self.generation += 1;
-        let job =
-            WorldJob { generation: self.generation, input: input.clone(), reveal: false, refresh };
+        let job = WorldJob {
+            generation: self.generation,
+            input: input.clone(),
+            reveal: false,
+            refresh,
+            switch,
+        };
         self.jobs.send(job).unwrap();
         let completion = self.done.recv().unwrap();
         (completion.input, completion.snapshot.map(|s| s.expect("the build succeeds")))
@@ -365,4 +384,79 @@ fn a_path_limited_read_never_rewrites_the_index() {
     let (_, landed) = worker.run(&input, paths(&["a.txt", "c.txt"]));
     assert!(landed.expect("a batch re-reads").touched.is_some(), "by path");
     assert_eq!(stamp(), before, ".git/index was rewritten");
+}
+
+fn changed(snapshot: &WorldSnapshot) -> Vec<String> {
+    snapshot.changeset.files.keys().cloned().collect()
+}
+
+fn listed(snapshot: &WorldSnapshot) -> Vec<String> {
+    snapshot.entries.iter().map(|e| e.path.clone()).collect()
+}
+
+/// A switch re-reads only what a refresh said moved: the parts it shares come from the cache.
+#[test]
+fn a_switch_reads_only_what_moved() {
+    let r = fixture();
+    let mut worker = Worker::on(&r);
+    let uncommitted = input_for(&r, Scope::Uncommitted, Tab::Changes);
+    let branch = input_for(&r, Scope::Branch, Tab::Changes);
+    assert!(changed(&worker.switch(&uncommitted, Refresh::Full)).is_empty());
+    // Written behind the worker's back: no refresh names it, so the cached listing stands.
+    r.write("quiet.txt", "q\n");
+    assert_eq!(changed(&worker.switch(&branch, Refresh::default())), ["a.txt"]);
+    // Once a batch names it, the next switch re-reads it.
+    r.write("named.txt", "n\n");
+    let built = worker.switch(&uncommitted, paths(&["named.txt"]));
+    assert_eq!(changed(&built), ["named.txt"]);
+    // A full refresh re-reads everything.
+    assert_eq!(
+        changed(&worker.switch(&branch, Refresh::Full)),
+        ["a.txt", "named.txt", "quiet.txt"]
+    );
+}
+
+/// A switch back to the last build's input, with nothing moved, is that build.
+#[test]
+fn a_switch_back_with_nothing_moved_is_the_last_build() {
+    let r = fixture();
+    let mut worker = Worker::on(&r);
+    let input = input_for(&r, Scope::Uncommitted, Tab::Changes);
+    r.write("new.txt", "x\n");
+    let first = worker.switch(&input, Refresh::Full);
+    r.write("late.txt", "x\n");
+    let again = worker.switch(&input, Refresh::default());
+    assert_eq!(changed(&again), changed(&first));
+    assert_eq!(again.touched, None, "a whole build, reconciled whole");
+}
+
+/// What moved while the `PR` tab showed still reaches the next file tab's build.
+#[test]
+fn what_moved_on_the_pr_tab_reaches_the_next_build() {
+    let r = fixture();
+    let mut worker = Worker::on(&r);
+    let changes = input_for(&r, Scope::Uncommitted, Tab::Changes);
+    let pr = input_for(&r, Scope::Uncommitted, Tab::Pr);
+    worker.switch(&changes, Refresh::Full);
+    r.write("new.txt", "x\n");
+    assert!(worker.run(&pr, paths(&["new.txt"])).1.is_none(), "the PR tab builds nothing");
+    assert_eq!(changed(&worker.switch(&changes, Refresh::default())), ["new.txt"]);
+}
+
+/// `All files` reuses the cached ignored listing across switches, and a batch re-reads under it.
+#[test]
+fn all_files_reuses_the_ignored_listing_and_a_batch_rereads_under_it() {
+    let r = fixture();
+    let mut worker = Worker::on(&r);
+    let uncommitted = input_for(&r, Scope::Uncommitted, Tab::AllFiles);
+    let branch = input_for(&r, Scope::Branch, Tab::AllFiles);
+    r.write("target/out.o", "x\n");
+    assert!(listed(&worker.switch(&uncommitted, Refresh::Full)).contains(&"target".to_string()));
+    r.write("build/x.o", "x\n");
+    r.write(".gitignore", "target/\nbuild/\n");
+    let built = worker.switch(&branch, paths(&["build", ".gitignore"]));
+    let entries = listed(&built);
+    assert!(entries.contains(&"target".to_string()), "{entries:?}");
+    assert!(entries.contains(&"build".to_string()), "{entries:?}");
+    assert!(!entries.iter().any(|e| e.starts_with("build/")), "collapsed: {entries:?}");
 }
