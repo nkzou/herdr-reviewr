@@ -1632,8 +1632,88 @@ pub fn snapshot_worktree(repo: &Path) -> Result<String> {
     let copied = session.copy_file.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let seed = copied.filter(|copy| copy.exists()).unwrap_or_else(|| session.git_dir.join("index"));
     index.seed(&seed)?;
-    index.git(repo, &["add", "-A"])?;
+    // Only what status names differs from the seed, so `add -A` re-reads only that.
+    let named = index.git(repo, &STATUS_ARGS).map(|out| parse_status(&out)).and_then(|status| {
+        let mut paths = status.tracked;
+        paths.extend(expand_untracked(repo, status.untracked)?);
+        Ok(paths)
+    });
+    let staged = match named {
+        Ok(paths) if paths.is_empty() => Ok(String::new()),
+        Ok(paths) if fits_command_line(&paths) => {
+            index.git(repo, &with_pathspecs(vec!["add", "-A"], &literal_pathspecs(&paths)))
+        }
+        _ => Err(anyhow::anyhow!("past the cap")),
+    };
+    // A path gone between the two reads, or past the cap: the whole walk is right.
+    if staged.is_err() {
+        index.git(repo, &["add", "-A"])?;
+    }
     Ok(index.git(repo, &["write-tree"])?.trim().to_string())
+}
+
+/// One status read: untracked collapsed per directory, so git's untracked cache and fsmonitor serve it.
+const STATUS_ARGS: [&str; 6] = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--untracked-files=normal",
+    "--ignore-submodules=dirty",
+    "--no-renames",
+];
+
+/// What one [`STATUS_ARGS`] read names: tracked paths with any change, and untracked paths.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StatusPaths {
+    tracked: Vec<String>,
+    /// A wholly untracked directory ends in `/`.
+    untracked: Vec<String>,
+}
+
+/// Parse porcelain v2 `-z`: a path is the last field, a rename's source the next record.
+fn parse_status(out: &str) -> StatusPaths {
+    let mut paths = StatusPaths::default();
+    let mut records = out.split('\0').filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        let Some((kind, fields)) = record.split_once(' ') else { continue };
+        let path = |n: usize| fields.splitn(n, ' ').nth(n - 1).map(str::to_string);
+        match kind {
+            "?" => paths.untracked.push(fields.to_string()),
+            "1" => paths.tracked.extend(path(8)),
+            "2" => {
+                paths.tracked.extend(path(9));
+                paths.tracked.extend(records.next().map(str::to_string));
+            }
+            "u" => paths.tracked.extend(path(10)),
+            _ => {}
+        }
+    }
+    paths
+}
+
+/// Expand status's untracked directories to their files, as `ls-files --others` lists them.
+fn expand_untracked(repo: &Path, listed: Vec<String>) -> Result<Vec<String>> {
+    let (dirs, mut files): (Vec<String>, Vec<String>) =
+        listed.into_iter().partition(|p| p.ends_with('/'));
+    if dirs.is_empty() {
+        return Ok(files);
+    }
+    let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+    // Past the cap, one whole walk.
+    let out = if fits_command_line(&dirs) {
+        git(repo, &with_pathspecs(args, &literal_pathspecs(&dirs)))?
+    } else {
+        let walked = nul_list(&git(repo, &args)?);
+        return Ok(walked);
+    };
+    files.extend(nul_list(&out));
+    Ok(files)
+}
+
+/// Every untracked file, as `ls-files --others --exclude-standard` lists them, in one fast status.
+pub fn untracked_files(repo: &Path) -> Result<Vec<String>> {
+    let status = parse_status(&git(repo, &STATUS_ARGS)?);
+    expand_untracked(repo, status.untracked)
 }
 
 /// The tree `seed` with `paths` re-read from the worktree: a full snapshot's tree when nothing
@@ -1658,10 +1738,21 @@ pub fn snapshot_worktree_in(repo: &Path, seed: &str, paths: &[String]) -> Result
 /// A cheap fingerprint of what the index stages, read from the index alone.
 pub fn staged_fingerprint(repo: &Path) -> Result<u64> {
     use std::hash::{Hash, Hasher};
+    let session = session(repo)?;
+    // An index unchanged since the last read stages the same, so its fingerprint is reused.
+    let stamp = Stamp::read(&session.git_dir.join("index")).ok().flatten();
+    let mut kept = session.staged.lock().unwrap_or_else(PoisonError::into_inner);
+    if let (Some(now), Some((then, fingerprint))) = (&stamp, kept.as_ref())
+        && now == then
+    {
+        return Ok(*fingerprint);
+    }
     let staged = git(repo, &["ls-files", "--stage", "-z"])?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     staged.hash(&mut hasher);
-    Ok(hasher.finish())
+    let fingerprint = hasher.finish();
+    *kept = stamp.map(|s| (s, fingerprint));
+    Ok(fingerprint)
 }
 
 /// The most pathspec bytes one git call takes: Windows caps a command line at 32,767 characters.
@@ -1766,7 +1857,7 @@ impl IndexCopy {
 
     /// Copy the index at `real` again if it changed since the last copy, keeping its mtime.
     fn seed(&mut self, real: &Path) -> Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::Seek;
         let mut from = match std::fs::File::open(real) {
             Ok(file) => file,
             // A fresh repository has no index yet, and git reads a missing one as empty.
@@ -1778,12 +1869,7 @@ impl IndexCopy {
             // Any other failure is no answer: an empty index would list every file deleted.
             Err(e) => return Err(e).context("reading the index"),
         };
-        // The index's trailing checksum names its content even within one mtime tick.
-        let meta = from.metadata().context("reading the index")?;
-        let mut tail = vec![0; usize::try_from(meta.len().min(32)).unwrap_or(0)];
-        from.seek(SeekFrom::End(-(tail.len() as i64))).context("reading the index")?;
-        from.read_exact(&mut tail).context("reading the index")?;
-        let stamp = Stamp { modified: meta.modified().context("reading the index")?, tail };
+        let stamp = Stamp::of(&mut from).context("reading the index")?;
         if self.seeded.as_ref() == Some(&stamp) {
             return Ok(());
         }
@@ -1819,6 +1905,27 @@ impl IndexCopy {
 struct Stamp {
     modified: std::time::SystemTime,
     tail: Vec<u8>,
+}
+
+impl Stamp {
+    /// The stamp of the open index `file`; the trailing checksum names its content within one mtime tick.
+    fn of(file: &mut std::fs::File) -> std::io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let meta = file.metadata()?;
+        let mut tail = vec![0; usize::try_from(meta.len().min(32)).unwrap_or(0)];
+        file.seek(SeekFrom::End(-(tail.len() as i64)))?;
+        file.read_exact(&mut tail)?;
+        Ok(Self { modified: meta.modified()?, tail })
+    }
+
+    /// The stamp of the index at `path`, `None` when there is none yet.
+    fn read(path: &Path) -> std::io::Result<Option<Self>> {
+        match std::fs::File::open(path) {
+            Ok(mut file) => Self::of(&mut file).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Remove `repo`'s copies whose `lock` is free, or that never got one within an hour: their
@@ -1861,6 +1968,8 @@ struct RepoSession {
     copy_file: Mutex<Option<PathBuf>>,
     counts: Mutex<Arc<Counts>>,
     sizes: Mutex<HashMap<String, u64>>,
+    /// The last staged fingerprint and the index stamp it was read at.
+    staged: Mutex<Option<(Stamp, u64)>>,
 }
 
 /// Every live session by worktree.
@@ -2125,12 +2234,18 @@ fn all_files_listed(repo: &Path, specs: &[String]) -> Result<Vec<WorktreeEntry>>
     let limit = |args: Vec<&'static str>| -> Vec<&str> {
         if specs.is_empty() { args } else { with_pathspecs(args, specs) }
     };
-    // Tracked and untracked in one spawn, with the same excludes `changed_from` uses.
-    let listed =
-        git(repo, &limit(vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"]))?;
+    // Tracked from the index, untracked by the same listing `changed_from` uses.
+    let listed = if specs.is_empty() {
+        let mut listed = nul_list(&git(repo, &["ls-files", "--cached", "-z"])?);
+        listed.extend(untracked_files(repo)?);
+        listed
+    } else {
+        let args = vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"];
+        nul_list(&git(repo, &limit(args))?)
+    };
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for path in nul_list(&listed) {
+    for path in listed {
         if seen.insert(path.clone()) {
             out.push(WorktreeEntry { path, ignored: false, is_dir: false });
         }
@@ -2217,15 +2332,17 @@ fn assemble(
     }
 
     if worktree {
-        // Untracked files are additions, by the same listing `all_files` uses.
-        let specs = literal_pathspecs(paths.unwrap_or_default());
-        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
-        if paths.is_some() {
-            args = with_pathspecs(args, &specs);
-        }
-        let others = git(repo, &args)?;
+        // Untracked files are additions, by the same listing `all_files` uses; a narrow walk is cheap.
+        let others = match paths {
+            None => untracked_files(repo)?,
+            Some(paths) => {
+                let specs = literal_pathspecs(paths);
+                let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+                nul_list(&git(repo, &with_pathspecs(args, &specs))?)
+            }
+        };
         let new_paths: Vec<&str> =
-            others.split('\0').filter(|p| !p.is_empty() && !seen.contains(*p)).collect();
+            others.iter().map(String::as_str).filter(|p| !seen.contains(*p)).collect();
         // A failed attribute read costs the verdict, never the whole changeset.
         let undiffable = diff_unset(repo, &new_paths).unwrap_or_default();
         let mut buf = vec![0; 64 * 1024];
@@ -2515,9 +2632,31 @@ fn blob_sizes(repo: &Path, oids: &[&str]) -> Result<HashMap<String, u64>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_numstat, parse_raw,
+        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, StatusPaths,
+        classify_remote, parse_numstat, parse_raw, parse_status,
     };
+
+    #[test]
+    fn status_names_every_changed_path_and_each_untracked_entry() {
+        let out = [
+            "1 .M N... 100644 100644 100644 0000 0000 a b.txt",
+            "2 R. N... 100644 100644 100644 0000 0000 R100 new name.txt",
+            "old name.txt",
+            "u UU N... 100644 100644 100644 100644 0000 0000 0000 c d.txt",
+            "? e f/",
+            "? g.txt",
+            "! ignored.txt",
+            "",
+        ]
+        .join("\0");
+        let tracked = ["a b.txt", "new name.txt", "old name.txt", "c d.txt"];
+        let untracked = ["e f/", "g.txt"];
+        let expected = StatusPaths {
+            tracked: tracked.map(str::to_string).to_vec(),
+            untracked: untracked.map(str::to_string).to_vec(),
+        };
+        assert_eq!(parse_status(&out), expected);
+    }
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
 
