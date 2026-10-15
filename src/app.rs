@@ -81,6 +81,9 @@ impl Tab {
     }
 }
 
+/// How long a deferred switch holds the old frame before `loading…` paints.
+pub const SWITCH_HOLD: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// The inactive file tab's place state, swapped in on a switch.
 #[derive(Debug, Default)]
 struct TabStash {
@@ -101,6 +104,18 @@ struct TabStash {
     rendered: RenderedView,
     /// Whether this tab ever loaded; a first visit loads before the frame.
     visited: bool,
+    /// This tab's deferred load that has not landed, as [`App::loading`].
+    loading: Option<std::time::Instant>,
+}
+
+/// Where a switch's world build runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorldLoad {
+    /// On the caller, before it returns: the tests and the recovery worker.
+    #[default]
+    Inline,
+    /// On the world worker, the frame holding and then painting `loading…` until it lands.
+    Deferred,
 }
 
 /// A file crossing waiting for its hunk step to repeat, holding the file it resolved.
@@ -749,6 +764,11 @@ pub struct App {
     pub refresh_commanded: bool,
     /// Whether the active file tab ever loaded.
     tab_visited: bool,
+    /// Where a switch's world build runs.
+    world_load: WorldLoad,
+    /// The active tab's deferred load that has not landed: the frame holds until this instant,
+    /// then paints `loading…`.
+    loading: Option<std::time::Instant>,
     highlighter: Highlighter,
     /// The active palette every renderer paints from.
     palette: Palette,
@@ -916,6 +936,8 @@ impl App {
             refresh_indicator: false,
             refresh_commanded: false,
             tab_visited: false,
+            world_load: WorldLoad::Inline,
+            loading: None,
             highlighter: Highlighter::new(theme.syntax),
             palette: theme.palette,
             theme_name: theme.name,
@@ -1192,6 +1214,38 @@ impl App {
         Ok(())
     }
 
+    /// Run every later switch's build on the world worker; the event loop calls this once.
+    pub fn defer_world_loads(&mut self) {
+        self.world_load = WorldLoad::Deferred;
+    }
+
+    /// Load the active file tab for a switch: inline, or on the worker behind a held frame.
+    /// `hold` keeps the old frame up to the indicator delay; without it, `loading…` paints at once.
+    pub fn load_view(&mut self, hold: std::time::Duration) -> Result<()> {
+        if self.world_load == WorldLoad::Inline {
+            return self.reload();
+        }
+        self.ensure_config_ready()?;
+        if !self.tab.is_file_tab() {
+            return Ok(());
+        }
+        self.loading = Some(std::time::Instant::now() + hold);
+        self.request_world_refresh(true);
+        Ok(())
+    }
+
+    /// Whether the active file tab waits on a deferred load, so its list and diff are not shown.
+    pub fn loading(&self) -> bool {
+        self.loading.is_some() && self.tab.is_file_tab()
+    }
+
+    /// How much longer the old frame holds before `loading…` paints; `None` once it paints.
+    pub fn load_hold(&self) -> Option<std::time::Duration> {
+        let until = self.loading.filter(|_| self.tab.is_file_tab())?;
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
     /// The input the next world build reads, and the tag its snapshot must match.
     pub fn world_input(&self) -> crate::world::WorldInput {
         crate::world::WorldInput {
@@ -1274,6 +1328,7 @@ impl App {
         }
         self.refresh_commit_picker(snapshot.head.as_deref());
         self.tab_visited = true;
+        self.loading = None;
     }
 
     /// The text of the read-pane row the multi-click chain targets.
@@ -2501,8 +2556,19 @@ impl App {
             self.file_cursor = 0;
             self.expanded_folds.clear();
             self.reset_diff_view();
-            // Before the frame, so no list shows under another base's label.
-            self.reload()?;
+            // No list shows under another base's label: inline before the frame, or held.
+            self.load_view(SWITCH_HOLD)?;
+        } else if self.world_load == WorldLoad::Deferred {
+            self.stash.file_cursor = 0;
+            self.stash.expanded_folds.clear();
+            self.stash.diff_cursor = 0;
+            self.stash.diff_scroll = 0;
+            self.stash.h_scroll = 0;
+            self.stash.select_anchor = None;
+            // The stashed `Changes` list is the old base's: it waits on its own load at return.
+            self.stash.loading = Some(std::time::Instant::now());
+            // The tree's badges are the old base's until the build lands.
+            self.load_view(SWITCH_HOLD)?;
         } else {
             self.stash.file_cursor = 0;
             self.stash.expanded_folds.clear();
@@ -2559,10 +2625,13 @@ impl App {
             }
         }
         // A return paints its stash and refreshes behind; a first visit loads before the frame.
-        if self.tab_visited {
+        if self.tab_visited && self.loading.is_none() {
             self.request_world_refresh(true);
+        } else if self.tab_visited {
+            // Left before its load landed: it shows `loading…` now and loads again.
+            self.load_view(std::time::Duration::ZERO)?;
         } else {
-            self.reload()?;
+            self.load_view(SWITCH_HOLD)?;
         }
         self.settle_tab_entry();
         // A find band opened over the other tab's file does not search this one's.
@@ -2787,6 +2856,7 @@ impl App {
         std::mem::swap(&mut self.rendered, &mut self.stash.rendered);
         std::mem::swap(&mut self.comment_target, &mut self.stash.comment_target);
         std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
+        std::mem::swap(&mut self.loading, &mut self.stash.loading);
     }
 
     /// Flip focus; a hidden navigator is shown and focused instead.

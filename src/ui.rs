@@ -1350,6 +1350,10 @@ fn pick_label(app: &App) -> Option<(String, String, String, String)> {
 
 /// The base label truncated to fit, the name before the skipped tail and `(sha)` kept.
 fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String, String)> {
+    // A loading tab names no base: the resolved one may be the old pick's.
+    if app.loading() {
+        return None;
+    }
     let (lead, shown, marker, tail) = base_label(app)?;
     // Everything else on the line plus the base's own gap and the suffix's minimum gap.
     let fixed = header_prefix_len(&tab_spans(keymap, app.pr_forge))
@@ -1382,8 +1386,15 @@ fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String,
     Some((lead, name, tail))
 }
 
+/// What a loading tab's list and read pane say.
+const LOADING: &str = "loading…";
+
 /// The header suffix: the changed-file count and line totals, measured by display width.
 fn header_suffix(app: &App) -> String {
+    // A loading tab counts nothing: the count would describe the old list.
+    if app.loading() {
+        return String::new();
+    }
     let (added, removed) = app.changed_totals();
     let stats = stats_str(added, removed);
     let gap = if stats.is_empty() { "" } else { "  " };
@@ -1454,6 +1465,11 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     spans.push(Span::styled(" ".repeat(pad), bar));
+    if app.loading() {
+        spans.push(Span::styled(HEADER_LEAD, bar));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     // `header_suffix` in colored parts.
     let (added, removed) = app.changed_totals();
     spans.push(Span::styled(
@@ -1482,9 +1498,10 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.file_rows.is_empty() {
+    if app.file_rows.is_empty() || app.loading() {
         let gone = app.commits_gone_message();
         let msg = match app.tab {
+            _ if app.loading() => LOADING,
             Tab::AllFiles => "no files",
             Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
             Tab::Changes if app.commits_gone() => gone.as_str(),
@@ -1750,6 +1767,11 @@ pub const CR_MARKER: &str = "^M";
 fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let mut title = match (&app.diff_path, &app.diff.previous_path) {
+        _ if app.loading() => match app.tab {
+            Tab::AllFiles => "File",
+            _ => "Diff",
+        }
+        .to_string(),
         (Some(new), Some(old)) => format!("{old} → {new}"),
         (Some(new), None) => new.clone(),
         (None, _) => match app.tab {
@@ -1758,13 +1780,17 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         }
         .to_string(),
     };
-    if app.rendered_active() {
+    if app.rendered_active() && !app.loading() {
         title.push_str(" · rendered");
     }
     let block = bordered(&title, app.focus == Focus::Diff, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if app.loading() {
+        frame.render_widget(dim_paragraph(LOADING, p), inner);
+        return;
+    }
     if app.visible.is_empty() {
         // `All files` is no diff, so its copy avoids diff words.
         let gone = app.commits_gone_message();

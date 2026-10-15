@@ -74,6 +74,8 @@ pub fn run() -> Result<()> {
     cfg.plugin_config_dir = config::resolve_config_dir(herdr::plugin_config_dir);
     let initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(&cfg, &initial_config);
+    // Every switch from here builds on the world worker, so no git call holds a frame.
+    app.defer_world_loads();
 
     let mut terminal = ratatui::init();
     // `ratatui::init` claimed the screen and raw mode; the input modes are left.
@@ -85,8 +87,9 @@ pub fn run() -> Result<()> {
     }
     // A cosmetic label; identity is the process.
     herdr::label_pane(&app.herdr.ids);
+    // The first build runs on the worker, so `loading…` paints at once instead of a frozen pane.
     if initial_config.is_ok()
-        && let Err(e) = app.reload()
+        && let Err(e) = app.load_view(Duration::ZERO)
     {
         logln!("startup reload failed: {e:#}");
         app.status = format!("load failed: {e}");
@@ -890,6 +893,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     match recovery_verdict(&target, now) {
                         Recovery::Swap => {
                             recovered.carry_authored_state_from(app);
+                            recovered.defer_world_loads();
                             *app = recovered;
                             pr.recover();
                         }
@@ -980,7 +984,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             // A hidden pane paints nothing: herdr keeps its last frame, and showing it draws again.
             // A painted age repaints when it rolls over, while on screen.
             let mut age_due = None;
-            if app.pane_visible() {
+            // A deferred switch holds the old frame, so a fast build swaps in with no `loading…`.
+            let load_hold = app.load_hold();
+            if app.pane_visible() && (load_hold.is_none() || repaint_whole) {
                 if std::mem::take(&mut repaint_whole) {
                     invalidate_screen(terminal)?;
                 }
@@ -1284,6 +1290,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             }
             if let Some(wake) = glyph_wake {
                 timeout = timeout.min(wake.max(Duration::from_millis(15)));
+            }
+            // A held frame paints `loading…` on time.
+            if let Some(left) = load_hold {
+                timeout = timeout.min(left);
             }
             if let Some(started) = pr.wait_started {
                 timeout = timeout.min(INDICATOR_DELAY.saturating_sub(started.elapsed()));
@@ -1885,6 +1895,11 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
+    // A loading tab shows no list or diff, so nothing that acts on them answers.
+    if app.loading() && action.is_some_and(|a| !answers_while_loading(a)) {
+        return Ok(());
+    }
+
     if let Some(action) = action {
         match action {
             K::Quit => app.request_quit(),
@@ -1955,6 +1970,34 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `action` works while the tab loads: it switches, changes the layout, or exports.
+fn answers_while_loading(action: crate::keymap::Action) -> bool {
+    use crate::keymap::Action as K;
+    matches!(
+        action,
+        K::Quit
+            | K::Refresh
+            | K::TabChanges
+            | K::TabAllFiles
+            | K::TabPr
+            | K::ScopeUncommitted
+            | K::ScopeBranch
+            | K::ScopeLastTurn
+            | K::ScopeCommits
+            | K::BasePick
+            | K::CommitPick
+            | K::NavigatorPosition
+            | K::NavigatorHide
+            | K::NavigatorGrow
+            | K::NavigatorShrink
+            | K::Wrap
+            | K::Rendered
+            | K::Send
+            | K::Copy
+            | K::Keys
+    )
 }
 
 /// Cancel pointer state whose coordinates belonged to the old terminal geometry.
@@ -2341,6 +2384,10 @@ pub fn handle_mouse(
     keymap: &Keymap,
     target: &dyn crate::export::ExportTarget,
 ) -> Result<()> {
+    // A loading tab's rows are not on screen, so no click or wheel can aim at them.
+    if app.loading() {
+        return Ok(());
+    }
     let done = dispatch_mouse(app, m, area, heights, keymap, target);
     app.settle_pick();
     done
