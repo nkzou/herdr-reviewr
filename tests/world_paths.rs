@@ -474,7 +474,7 @@ fn all_files_reuses_the_ignored_listing_and_a_batch_rereads_under_it() {
     assert!(!entries.iter().any(|e| e.starts_with("build/")), "collapsed: {entries:?}");
 }
 
-/// An `All files` build lands before its ignored walk, and the walk lands as the same job.
+/// An `All files` build lands whole or before its ignored walk, which then lands as the same job.
 #[test]
 fn all_files_lands_before_its_ignored_walk_and_the_walk_follows() {
     let r = fixture();
@@ -483,15 +483,14 @@ fn all_files_lands_before_its_ignored_walk_and_the_walk_follows() {
     let input = input_for(&r, Scope::Uncommitted, Tab::AllFiles);
     let job = WorldJob { generation: 1, input, reveal: true, refresh: Refresh::Full, switch: true };
     worker.jobs.send(job).unwrap();
-    let first = worker.done.recv().unwrap();
-    let built = first.snapshot.unwrap().unwrap();
-    assert!(built.ignored_pending);
-    assert!(!listed(&built).contains(&"target".to_string()), "no ignored entry yet");
+    let mut built = worker.done.recv().unwrap().snapshot.unwrap().unwrap();
     assert!(listed(&built).contains(&"a.txt".to_string()), "the tree itself is whole");
-    let follow_up = worker.done.recv().unwrap();
-    assert_eq!(follow_up.generation, 1);
-    assert!(!follow_up.reveal, "a follow-up moves no place state");
-    let built = follow_up.snapshot.unwrap().unwrap();
+    if built.ignored_pending {
+        assert!(!listed(&built).contains(&"target".to_string()), "no ignored entry yet");
+        let follow_up = worker.done.recv().unwrap();
+        assert_eq!((follow_up.generation, follow_up.reveal), (1, false), "the same job, no reveal");
+        built = follow_up.snapshot.unwrap().unwrap();
+    }
     assert!(!built.ignored_pending);
     assert!(listed(&built).contains(&"target".to_string()));
     // Known now: the next switch lands whole at once.

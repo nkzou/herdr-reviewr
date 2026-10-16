@@ -1632,21 +1632,17 @@ pub fn snapshot_worktree(repo: &Path) -> Result<String> {
     let copied = session.copy_file.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let seed = copied.filter(|copy| copy.exists()).unwrap_or_else(|| session.git_dir.join("index"));
     index.seed(&seed)?;
-    // Only what status names differs from the seed, so `add -A` re-reads only that.
-    let named = index.git(repo, &STATUS_ARGS).map(|out| parse_status(&out)).and_then(|status| {
-        let mut paths = status.tracked;
-        paths.extend(expand_untracked(repo, status.untracked)?);
-        Ok(paths)
+    // Only what status names differs from the seed; `add -A` takes a new directory whole.
+    let staged = index.git(repo, &STATUS_ARGS).is_ok_and(|out| {
+        let (mut paths, untracked) = parse_status(&out);
+        paths.extend(untracked);
+        let specs = literal_pathspecs(&paths);
+        paths.is_empty()
+            || (fits_command_line(&paths)
+                && index.git(repo, &with_pathspecs(vec!["add", "-A"], &specs)).is_ok())
     });
-    let staged = match named {
-        Ok(paths) if paths.is_empty() => Ok(String::new()),
-        Ok(paths) if fits_command_line(&paths) => {
-            index.git(repo, &with_pathspecs(vec!["add", "-A"], &literal_pathspecs(&paths)))
-        }
-        _ => Err(anyhow::anyhow!("past the cap")),
-    };
     // A path gone between the two reads, or past the cap: the whole walk is right.
-    if staged.is_err() {
+    if !staged {
         index.git(repo, &["add", "-A"])?;
     }
     Ok(index.git(repo, &["write-tree"])?.trim().to_string())
@@ -1662,64 +1658,41 @@ const STATUS_ARGS: [&str; 6] = [
     "--no-renames",
 ];
 
-/// What one [`STATUS_ARGS`] read names: tracked paths with any change, and untracked paths.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct StatusPaths {
-    tracked: Vec<String>,
-    /// A wholly untracked directory ends in `/`.
-    untracked: Vec<String>,
-}
-
-/// Parse porcelain v2 `-z`: a path is the last field, a rename's source the next record.
-fn parse_status(out: &str) -> StatusPaths {
-    let mut paths = StatusPaths::default();
-    let mut records = out.split('\0').filter(|r| !r.is_empty());
-    while let Some(record) = records.next() {
+/// Porcelain v2 `-z` without renames: the tracked paths with any change, then the untracked ones,
+/// a wholly untracked directory ending in `/`.
+fn parse_status(out: &str) -> (Vec<String>, Vec<String>) {
+    let (mut tracked, mut untracked) = (Vec::new(), Vec::new());
+    for record in out.split('\0') {
         let Some((kind, fields)) = record.split_once(' ') else { continue };
         let path = |n: usize| fields.splitn(n, ' ').nth(n - 1).map(str::to_string);
         match kind {
-            "?" => paths.untracked.push(fields.to_string()),
-            "1" => paths.tracked.extend(path(8)),
-            "2" => {
-                paths.tracked.extend(path(9));
-                paths.tracked.extend(records.next().map(str::to_string));
-            }
-            "u" => paths.tracked.extend(path(10)),
+            "?" => untracked.push(fields.to_string()),
+            "1" => tracked.extend(path(8)),
+            "u" => tracked.extend(path(10)),
             _ => {}
         }
     }
-    paths
+    (tracked, untracked)
 }
 
-/// Expand status's untracked directories to their files, as `ls-files --others` lists them.
-fn expand_untracked(repo: &Path, listed: Vec<String>) -> Result<Vec<String>> {
-    let (dirs, mut files): (Vec<String>, Vec<String>) =
-        listed.into_iter().partition(|p| p.ends_with('/'));
-    if dirs.is_empty() {
-        return Ok(files);
-    }
-    let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
-    // Past the cap, one whole walk.
-    let out = if fits_command_line(&dirs) {
-        git(repo, &with_pathspecs(args, &literal_pathspecs(&dirs)))?
-    } else {
-        let walked = nul_list(&git(repo, &args)?);
-        return Ok(walked);
-    };
-    files.extend(nul_list(&out));
-    Ok(files)
-}
-
-/// The untracked files under `paths`, by one narrow walk.
+/// The untracked files under `paths`, by one narrow walk; every one for no paths.
 pub fn untracked_under(repo: &Path, paths: &[String]) -> Result<Vec<String>> {
     let args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
     Ok(nul_list(&git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?))
 }
 
-/// Every untracked file, as `ls-files --others --exclude-standard` lists them, in one fast status.
+/// Every untracked file, as `ls-files --others --exclude-standard` lists them, in one fast status
+/// and one narrow walk of the directories it collapsed.
 pub fn untracked_files(repo: &Path) -> Result<Vec<String>> {
-    let status = parse_status(&git(repo, &STATUS_ARGS)?);
-    expand_untracked(repo, status.untracked)
+    let (dirs, mut files): (Vec<String>, Vec<String>) =
+        parse_status(&git(repo, &STATUS_ARGS)?).1.into_iter().partition(|p| p.ends_with('/'));
+    match dirs.as_slice() {
+        [] => {}
+        // Past the cap, one whole walk.
+        _ if !fits_command_line(&dirs) => return untracked_under(repo, &[]),
+        _ => files.extend(untracked_under(repo, &dirs)?),
+    }
+    Ok(files)
 }
 
 /// The tree `seed` with `paths` re-read from the worktree: a full snapshot's tree when nothing
@@ -1746,7 +1719,8 @@ pub fn staged_fingerprint(repo: &Path) -> Result<u64> {
     use std::hash::{Hash, Hasher};
     let session = session(repo)?;
     // An index unchanged since the last read stages the same, so its fingerprint is reused.
-    let stamp = Stamp::read(&session.git_dir.join("index")).ok().flatten();
+    let index = std::fs::File::open(session.git_dir.join("index"));
+    let stamp = index.and_then(|mut index| Stamp::of(&mut index)).ok();
     let mut kept = session.staged.lock().unwrap_or_else(PoisonError::into_inner);
     if let (Some(now), Some((then, fingerprint))) = (&stamp, kept.as_ref())
         && now == then
@@ -1923,15 +1897,6 @@ impl Stamp {
         file.read_exact(&mut tail)?;
         Ok(Self { modified: meta.modified()?, tail })
     }
-
-    /// The stamp of the index at `path`, `None` when there is none yet.
-    fn read(path: &Path) -> std::io::Result<Option<Self>> {
-        match std::fs::File::open(path) {
-            Ok(mut file) => Self::of(&mut file).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 /// Remove `repo`'s copies whose `lock` is free, or that never got one within an hour: their
@@ -2050,7 +2015,7 @@ pub fn changed_from_given(
     untracked: &[String],
 ) -> Result<Vec<ChangedFile>> {
     let out = IndexCopy::with(repo, |index| index.git(repo, &diff_args(&[base])))?;
-    assemble(repo, &out, Others::Given(untracked))
+    assemble(repo, &out, Some(untracked), None)
 }
 
 /// [`changed_from`] limited to `paths`, each a file or a directory.
@@ -2058,12 +2023,12 @@ pub fn changed_from_in(repo: &Path, base: &str, paths: &[String]) -> Result<Vec<
     let specs = literal_pathspecs(paths);
     let args = with_pathspecs(diff_args(&[base]), &specs);
     let out = IndexCopy::with(repo, |index| index.git(repo, &args))?;
-    assemble(repo, &out, Others::Under(paths))
+    assemble(repo, &out, Some(&untracked_under(repo, paths)?), Some(paths))
 }
 
 /// The changeset between two trees: `commits`, and `last-turn` against its snapshot.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
-    assemble(repo, &git(repo, &diff_args(&[old, new]))?, Others::None)
+    assemble(repo, &git(repo, &diff_args(&[old, new]))?, None, None)
 }
 
 /// [`changed_between`] limited to `paths`.
@@ -2075,7 +2040,7 @@ pub fn changed_between_in(
 ) -> Result<Vec<ChangedFile>> {
     let specs = literal_pathspecs(paths);
     let out = git(repo, &with_pathspecs(diff_args(&[old, new]), &specs))?;
-    assemble(repo, &out, Others::Trees(paths))
+    assemble(repo, &out, None, Some(paths))
 }
 
 /// One `git diff` per changeset: raw records, then line counts.
@@ -2237,28 +2202,33 @@ pub struct WorktreeEntry {
 
 /// Every worktree entry, sorted; an ignored directory collapses to one placeholder.
 pub fn all_files(repo: &Path) -> Result<Vec<WorktreeEntry>> {
-    let untracked = untracked_files(repo)?;
-    let ignored = ignored_listing(repo, None)?;
-    all_files_given(repo, &untracked, Some(&ignored))
+    all_files_given(repo, &untracked_files(repo)?, &ignored_listing(repo, &[])?)
 }
 
-/// [`all_files`] with the untracked and ignored entries already listed; `ignored` `None` lists none.
+/// [`all_files`] with the untracked and ignored entries already listed.
 pub fn all_files_given(
     repo: &Path,
     untracked: &[String],
-    ignored: Option<&[IgnoredEntry]>,
+    ignored: &[IgnoredEntry],
 ) -> Result<Vec<WorktreeEntry>> {
     let mut listed = nul_list(&git(repo, &["ls-files", "--cached", "-z"])?);
     listed.extend(untracked.iter().cloned());
-    let ignored = ignored.unwrap_or_default().iter().cloned();
     Ok(merge_listing(listed, ignored))
+}
+
+/// [`all_files`] limited to `paths`.
+pub fn all_files_in(repo: &Path, paths: &[String]) -> Result<Vec<WorktreeEntry>> {
+    let args = vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"];
+    let listed = nul_list(&git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?);
+    Ok(merge_listing(listed, &ignored_listing(repo, paths)?))
 }
 
 /// An ignored path and whether it is a directory, which collapses to one placeholder.
 pub type IgnoredEntry = (String, bool);
 
-/// The ignored entries, each ignored directory pruned at its top; under `paths` only, when given.
-pub fn ignored_listing(repo: &Path, paths: Option<&[String]>) -> Result<Vec<IgnoredEntry>> {
+/// The ignored entries under `paths` (all for none), pruned at each ignored directory instead of
+/// walking inside it.
+pub fn ignored_listing(repo: &Path, paths: &[String]) -> Result<Vec<IgnoredEntry>> {
     let args = vec![
         "ls-files",
         "--others",
@@ -2268,53 +2238,30 @@ pub fn ignored_listing(repo: &Path, paths: Option<&[String]>) -> Result<Vec<Igno
         "--no-empty-directory",
         "-z",
     ];
-    let specs = literal_pathspecs(paths.unwrap_or_default());
-    match paths {
-        Some(_) => ignored_entries(repo, &with_pathspecs(args, &specs)),
-        None => ignored_entries(repo, &args),
-    }
-}
-
-/// Listed paths first, then ignored entries not already listed, sorted by path.
-fn merge_listing(
-    listed: Vec<String>,
-    ignored: impl Iterator<Item = IgnoredEntry>,
-) -> Vec<WorktreeEntry> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in listed {
-        if seen.insert(path.clone()) {
-            out.push(WorktreeEntry { path, ignored: false, is_dir: false });
-        }
-    }
-    for (path, is_dir) in ignored {
-        if seen.insert(path.clone()) {
-            out.push(WorktreeEntry { path, ignored: true, is_dir });
-        }
-    }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
-}
-
-/// [`all_files`] limited to `paths`.
-pub fn all_files_in(repo: &Path, paths: &[String]) -> Result<Vec<WorktreeEntry>> {
-    let args = vec!["ls-files", "--cached", "--others", "--exclude-standard", "-z"];
-    let listed = nul_list(&git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?);
-    let ignored = ignored_listing(repo, Some(paths))?;
-    Ok(merge_listing(listed, ignored.into_iter()))
-}
-
-/// The ignored entries, pruned at each ignored directory instead of walking inside it.
-fn ignored_entries(repo: &Path, args: &[&str]) -> Result<Vec<(String, bool)>> {
-    let out = git(repo, args)?;
-    Ok(out
-        .split('\0')
-        .filter(|s| !s.is_empty())
+    let out = git(repo, &with_pathspecs(args, &literal_pathspecs(paths)))?;
+    Ok(nul_list(&out)
+        .into_iter()
         .map(|path| match path.strip_suffix('/') {
             Some(dir) => (dir.to_string(), true),
-            None => (path.to_string(), false),
+            None => (path, false),
         })
         .collect())
+}
+
+/// Listed paths, then ignored entries not already listed, sorted by path.
+fn merge_listing(listed: Vec<String>, ignored: &[IgnoredEntry]) -> Vec<WorktreeEntry> {
+    let listed =
+        listed.into_iter().map(|path| WorktreeEntry { path, ignored: false, is_dir: false });
+    let ignored = ignored.iter().map(|(path, is_dir)| WorktreeEntry {
+        path: path.clone(),
+        ignored: true,
+        is_dir: *is_dir,
+    });
+    let mut out: Vec<WorktreeEntry> = listed.chain(ignored).collect();
+    // A stable sort, so a listed path wins over its ignored duplicate.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
 }
 
 /// An ignored directory's children, read from disk; unreadable means none.
@@ -2330,27 +2277,15 @@ pub fn list_ignored_dir(repo: &Path, dir: &str) -> Vec<WorktreeEntry> {
     out
 }
 
-/// Which untracked files a changeset appends.
-#[derive(Clone, Copy)]
-enum Others<'a> {
-    /// A diff between trees, whole: none.
-    None,
-    /// A diff between trees, limited to these paths: none.
-    Trees(&'a [String]),
-    /// A worktree diff, whole: these, already listed.
-    Given(&'a [String]),
-    /// A worktree diff limited to these paths: the untracked files under them.
-    Under(&'a [String]),
-}
-
-/// The sorted changeset from one [`diff_args`] run, untracked files appended for a worktree diff.
-/// A path-limited read lists untracked files under its paths only, and their counts merge into the cache.
-fn assemble(repo: &Path, out: &str, others: Others<'_>) -> Result<Vec<ChangedFile>> {
-    let worktree = matches!(others, Others::Given(_) | Others::Under(_));
-    let paths = match others {
-        Others::Trees(paths) | Others::Under(paths) => Some(paths),
-        Others::None | Others::Given(_) => None,
-    };
+/// The sorted changeset from one [`diff_args`] run, the `untracked` files appended for a worktree
+/// diff. A read limited to `paths` merges its untracked counts into the cache.
+fn assemble(
+    repo: &Path,
+    out: &str,
+    untracked: Option<&[String]>,
+    paths: Option<&[String]>,
+) -> Result<Vec<ChangedFile>> {
+    let worktree = untracked.is_some();
     let (rows, numstat) = parse_raw(out);
     let counts = parse_numstat(numstat);
     let blobs: Vec<&str> = rows
@@ -2380,15 +2315,10 @@ fn assemble(repo: &Path, out: &str, others: Others<'_>) -> Result<Vec<ChangedFil
         });
     }
 
-    if worktree {
-        // Untracked files are additions, by the same listing `all_files` uses; a narrow walk is cheap.
-        let others = match others {
-            Others::Given(listed) => listed.to_vec(),
-            Others::Under(paths) => untracked_under(repo, paths)?,
-            Others::None | Others::Trees(_) => Vec::new(),
-        };
+    if let Some(untracked) = untracked {
+        // Untracked files are additions, by the same listing `all_files` uses.
         let new_paths: Vec<&str> =
-            others.iter().map(String::as_str).filter(|p| !seen.contains(*p)).collect();
+            untracked.iter().map(String::as_str).filter(|p| !seen.contains(*p)).collect();
         // A failed attribute read costs the verdict, never the whole changeset.
         let undiffable = diff_unset(repo, &new_paths).unwrap_or_default();
         let mut buf = vec![0; 64 * 1024];
@@ -2678,16 +2608,14 @@ fn blob_sizes(repo: &Path, oids: &[&str]) -> Result<HashMap<String, u64>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, StatusPaths,
-        classify_remote, parse_numstat, parse_raw, parse_status,
+        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
+        parse_numstat, parse_raw, parse_status,
     };
 
     #[test]
     fn status_names_every_changed_path_and_each_untracked_entry() {
         let out = [
             "1 .M N... 100644 100644 100644 0000 0000 a b.txt",
-            "2 R. N... 100644 100644 100644 0000 0000 R100 new name.txt",
-            "old name.txt",
             "u UU N... 100644 100644 100644 100644 0000 0000 0000 c d.txt",
             "? e f/",
             "? g.txt",
@@ -2695,13 +2623,8 @@ mod tests {
             "",
         ]
         .join("\0");
-        let tracked = ["a b.txt", "new name.txt", "old name.txt", "c d.txt"];
-        let untracked = ["e f/", "g.txt"];
-        let expected = StatusPaths {
-            tracked: tracked.map(str::to_string).to_vec(),
-            untracked: untracked.map(str::to_string).to_vec(),
-        };
-        assert_eq!(parse_status(&out), expected);
+        let names = |list: &[&str]| list.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_status(&out), (names(&["a b.txt", "c d.txt"]), names(&["e f/", "g.txt"])));
     }
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
