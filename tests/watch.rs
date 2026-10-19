@@ -31,7 +31,7 @@ impl Slot {
         let (live, freed) = &LIVE;
         let live = live.lock().unwrap_or_else(PoisonError::into_inner);
         let mut live =
-            freed.wait_while(live, |n| *n >= STREAMS).unwrap_or_else(PoisonError::into_inner);
+            freed.wait_while(live, |n| *n == STREAMS).unwrap_or_else(PoisonError::into_inner);
         *live += 1;
         Self
     }

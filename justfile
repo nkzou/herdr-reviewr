@@ -16,7 +16,6 @@ fmt-check:
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
-# isolated: no live herdr (a refusing binary, no socket), no machine git config (fsmonitor, hooks)
 # run the test suite, isolated
 test:
     {{isolated}} cargo test --all-features
@@ -25,6 +24,7 @@ test:
 test-fast:
     {{isolated}} cargo nextest run --all-features
 
+# isolated: no live herdr (a refusing binary, no socket), no machine git config (fsmonitor, hooks)
 isolated := "env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID -u HERDR_SOCKET_PATH HERDR_BIN_PATH=false GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1"
 
 # build (debug)

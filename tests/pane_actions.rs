@@ -1079,7 +1079,6 @@ fn hold_lock(dir: &Path, ws: &str) -> fs::File {
     file
 }
 
-/// Start `mode` with a focused pane in this crate's repo, its output captured.
 /// What a debug build divides its lock and visibility bounds by under [`shortened`].
 const BOUND_DIVISOR: u32 = if cfg!(debug_assertions) { 10 } else { 1 };
 
@@ -1089,12 +1088,14 @@ fn shortened(mut command: Command) -> Command {
     command
 }
 
+/// Start `command`, its output captured.
+fn captured(mut command: Command) -> Child {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+}
+
+/// Start `mode` with a focused pane in this crate's repo, its output captured.
 fn start(mode: &str, dir: &Path) -> Child {
-    with_context(mode, dir, &repo_context())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+    captured(with_context(mode, dir, &repo_context()))
 }
 
 #[test]
@@ -1149,10 +1150,7 @@ fn an_explicit_action_refuses_once_the_lock_stays_held_past_the_bound() {
     let _lock = hold_lock(dir.path(), "workspace-1");
 
     let started = Instant::now();
-    let spawn = |mode| {
-        let mut command = shortened(with_context(mode, dir.path(), &repo_context()));
-        command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
-    };
+    let spawn = |mode| captured(shortened(with_context(mode, dir.path(), &repo_context())));
     let children = ["toggle", "open", "close"].map(|mode| (mode, spawn(mode)));
     let bound = Duration::from_secs(49) / BOUND_DIVISOR;
     for (mode, child) in children {
