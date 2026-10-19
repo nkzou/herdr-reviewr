@@ -1465,23 +1465,20 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     spans.push(Span::styled(" ".repeat(pad), bar));
-    if app.loading() {
-        spans.push(Span::styled(HEADER_LEAD, bar));
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-        return;
-    }
-    // `header_suffix` in colored parts.
-    let (added, removed) = app.changed_totals();
-    spans.push(Span::styled(
-        format!("{} changed", app.changed_count()),
-        bar.fg(p.ink(Ink::TextMuted, Fill::Bar)),
-    ));
-    let stats = stats_spans(added, removed, p, Fill::Bar);
-    if !stats.is_empty() {
-        spans.push(Span::styled("  ", bar));
-        spans.extend(
-            stats.into_iter().map(|s| Span::styled(s.content, s.style.bg(p.fill(Fill::Bar)))),
-        );
+    // `header_suffix` in colored parts; a loading tab counts nothing.
+    if !app.loading() {
+        let (added, removed) = app.changed_totals();
+        spans.push(Span::styled(
+            format!("{} changed", app.changed_count()),
+            bar.fg(p.ink(Ink::TextMuted, Fill::Bar)),
+        ));
+        let stats = stats_spans(added, removed, p, Fill::Bar);
+        if !stats.is_empty() {
+            spans.push(Span::styled("  ", bar));
+            spans.extend(
+                stats.into_iter().map(|s| Span::styled(s.content, s.style.bg(p.fill(Fill::Bar)))),
+            );
+        }
     }
     spans.push(Span::styled(HEADER_LEAD, bar));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1768,12 +1765,9 @@ pub const CR_MARKER: &str = "^M";
 
 fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let mut title = match (&app.diff_path, &app.diff.previous_path) {
-        _ if app.loading() => match app.tab {
-            Tab::AllFiles => "File",
-            _ => "Diff",
-        }
-        .to_string(),
+    // A loading tab names no file: the open one may be the old list's.
+    let shown = app.diff_path.as_ref().filter(|_| !app.loading());
+    let mut title = match (shown, &app.diff.previous_path) {
         (Some(new), Some(old)) => format!("{old} → {new}"),
         (Some(new), None) => new.clone(),
         (None, _) => match app.tab {

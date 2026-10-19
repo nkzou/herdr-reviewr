@@ -1225,7 +1225,7 @@ impl App {
     }
 
     /// Load the active file tab for a switch: inline, or on the worker behind a held frame.
-    /// `hold` keeps the old frame up to the indicator delay; without it, `loading…` paints at once.
+    /// `hold` keeps the old frame that long at most; without it, `loading…` paints at once.
     pub fn load_view(&mut self, hold: std::time::Duration) -> Result<()> {
         if self.world_load == WorldLoad::Inline {
             return self.reload();
@@ -1964,19 +1964,17 @@ impl App {
     }
 
     /// Queue a build of what the view now shows; `reveal` is for user-initiated switches only.
-    pub fn request_world_refresh(&mut self, reveal: bool) {
+    pub fn request_world_refresh(&mut self, reveal: bool) -> &mut crate::world::WorldRequest {
         let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
         request.reveal |= reveal;
         request.background = false;
         request.switch = true;
+        request
     }
 
     /// Queue a build that reads everything again: `r`, or an editor that may have written.
     pub fn request_reread(&mut self) {
-        self.request_world_refresh(false);
-        if let Some(request) = self.world_request.as_mut() {
-            request.refresh.absorb(crate::world::Refresh::Full);
-        }
+        self.request_world_refresh(false).refresh.absorb(crate::world::Refresh::Full);
     }
 
     /// Snap the diff view back to the top, clearing any pending selection.
@@ -2576,37 +2574,31 @@ impl App {
             self.expanded_folds.clear();
             self.reset_diff_view();
             // No list shows under another base's label: inline before the frame, or held.
-            self.load_view(SWITCH_HOLD)?;
-        } else if self.world_load == WorldLoad::Deferred {
-            self.stash.file_cursor = 0;
-            self.stash.expanded_folds.clear();
-            self.stash.diff_cursor = 0;
-            self.stash.diff_scroll = 0;
-            self.stash.h_scroll = 0;
-            self.stash.select_anchor = None;
+            return self.load_view(SWITCH_HOLD);
+        }
+        self.stash.file_cursor = 0;
+        self.stash.expanded_folds.clear();
+        self.stash.diff_cursor = 0;
+        self.stash.diff_scroll = 0;
+        self.stash.h_scroll = 0;
+        self.stash.select_anchor = None;
+        if self.world_load == WorldLoad::Deferred {
             // The stashed `Changes` list is the old base's: it waits on its own load at return.
             self.stash.loading = Some(std::time::Instant::now());
             // The tree's badges are the old base's until the build lands.
-            self.load_view(SWITCH_HOLD)?;
-        } else {
-            self.stash.file_cursor = 0;
-            self.stash.expanded_folds.clear();
-            self.stash.diff_cursor = 0;
-            self.stash.diff_scroll = 0;
-            self.stash.h_scroll = 0;
-            self.stash.select_anchor = None;
-            // `All files` keeps its tree; only the changed set rebuilds now.
-            let build = crate::world::build_changed(&self.world_input())?;
-            self.adopt_branch_base(build.branch_base);
-            self.adopt_pick_status(build.pick_status);
-            self.changeset = build.changeset;
-            // Re-mark the badges in place, so none belongs to the old base.
-            for entry in &mut self.entries {
-                entry.annotation = self.changeset.files.get(&entry.path).cloned();
-            }
-            self.rebuild_file_rows();
-            self.request_world_refresh(false);
+            return self.load_view(SWITCH_HOLD);
         }
+        // `All files` keeps its tree; only the changed set rebuilds now.
+        let build = crate::world::build_changed(&self.world_input())?;
+        self.adopt_branch_base(build.branch_base);
+        self.adopt_pick_status(build.pick_status);
+        self.changeset = build.changeset;
+        // Re-mark the badges in place, so none belongs to the old base.
+        for entry in &mut self.entries {
+            entry.annotation = self.changeset.files.get(&entry.path).cloned();
+        }
+        self.rebuild_file_rows();
+        self.request_world_refresh(false);
         Ok(())
     }
 
@@ -2643,7 +2635,7 @@ impl App {
                 self.settle_read();
             }
         }
-        // A return paints its stash and refreshes behind; a first visit loads before the frame.
+        // A return paints its stash and refreshes behind; a first visit loads before it shows.
         if self.tab_visited && self.loading.is_none() {
             self.request_world_refresh(true);
         } else if self.tab_visited {
