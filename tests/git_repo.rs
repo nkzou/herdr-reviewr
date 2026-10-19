@@ -1869,7 +1869,7 @@ fn untracked_files_match_the_whole_walk() {
         .map(str::to_string)
         .collect();
     walked.sort();
-    let mut listed = untracked_files(r.path()).unwrap();
+    let mut listed = untracked_files(r.path(), &[]).unwrap();
     listed.sort();
     assert_eq!(listed, walked);
 }

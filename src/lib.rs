@@ -700,10 +700,7 @@ pub fn land_world_completion(
         }
         Some(Err(e)) => {
             app.status = format!("refresh failed: {e}");
-            // A switch's view is still owed, so its retry builds whole.
-            let owed =
-                if completion.switch { crate::world::Refresh::Full } else { completion.refresh };
-            Landing::Failed(owed)
+            Landing::Failed(completion.refresh)
         }
         None => Landing::Landed,
     }

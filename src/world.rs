@@ -93,7 +93,7 @@ pub struct ScopeBuild {
 #[derive(Debug, Default)]
 pub struct Parts {
     untracked: Part<String>,
-    ignored: Part<git::IgnoredEntry>,
+    ignored: Part<git::WorktreeEntry>,
     /// The base resolution and its merge-base, keyed by the `--base` flag and the pick epoch.
     base: Option<((Option<String>, u64), BaseRead)>,
     /// The worktree as a tree, `last-turn`'s new end.
@@ -127,7 +127,11 @@ impl<T> Part<T> {
         let listed = match self.listed.take() {
             Some(listed) if moved.is_empty() => listed,
             Some(listed) if git::fits_command_line(&moved) => {
-                let kept = listed.into_iter().filter(|t| !git::covered(&moved, path(t)));
+                // A narrow read lists the collapsed directory above a path, so that goes too.
+                let near = |p: &str| {
+                    moved.iter().any(|m| git::under_or_eq(p, m) || git::under_or_eq(m, p))
+                };
+                let kept = listed.into_iter().filter(|t| !near(path(t)));
                 kept.chain(read(&moved)?).collect()
             }
             _ => read(&[])?,
@@ -151,15 +155,16 @@ impl Parts {
     }
 
     fn untracked(&mut self, repo: &Path) -> Result<&[String]> {
-        let read = |paths: &[String]| match paths {
-            [] => git::untracked_files(repo),
-            paths => git::untracked_under(repo, paths),
-        };
-        self.untracked.get(read, String::as_str)
+        self.untracked.get(|paths| git::untracked_files(repo, paths), String::as_str)
     }
 
-    fn ignored(&mut self, repo: &Path) -> Result<&[git::IgnoredEntry]> {
-        self.ignored.get(|paths| git::ignored_listing(repo, paths), |(path, _)| path.as_str())
+    fn ignored(&mut self, repo: &Path) -> Result<&[git::WorktreeEntry]> {
+        self.ignored.get(|paths| git::ignored_listing(repo, paths), |w| w.path.as_str())
+    }
+
+    /// Whether a build leaves the ignored entries to the walk: deferring, and none listed yet.
+    fn ignored_deferred(&self) -> bool {
+        self.defer_ignored && self.ignored.listed.is_none()
     }
 
     fn base(&mut self, input: &WorldInput) -> Result<BaseRead> {
@@ -211,8 +216,7 @@ pub fn build_with(input: &WorldInput, parts: &mut Parts) -> Result<WorldSnapshot
     let ScopeBuild { branch_base, pick_status, changeset } =
         scope_build(input, head.clone(), parts)?;
     // A deferred walk leaves the ignored entries out, landing them when it finishes.
-    let ignored_pending =
-        input.tab == Tab::AllFiles && parts.defer_ignored && parts.ignored.listed.is_none();
+    let ignored_pending = input.tab == Tab::AllFiles && parts.ignored_deferred();
     let entries = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
         Tab::AllFiles => all_files_entries(input, &changeset.files, parts)?,
@@ -234,20 +238,16 @@ pub fn build_with(input: &WorldInput, parts: &mut Parts) -> Result<WorldSnapshot
 fn with_ignored(
     mut snapshot: WorldSnapshot,
     input: &WorldInput,
-    ignored: &[git::IgnoredEntry],
+    ignored: &[git::WorktreeEntry],
 ) -> WorldSnapshot {
-    let present: HashSet<String> = snapshot.entries.iter().map(|e| e.path.clone()).collect();
-    for (path, is_dir) in ignored {
-        if !present.contains(path) {
-            let w = git::WorktreeEntry { path: path.clone(), ignored: true, is_dir: *is_dir };
-            let annotation = snapshot.changeset.files.get(path).cloned();
-            snapshot.entries.push(Entry::from_worktree(w, annotation));
-        }
+    // Listed first, so `load_toggled` keeps a listed path over its ignored duplicate.
+    let mut entries = std::mem::take(&mut snapshot.entries);
+    for w in ignored {
+        let annotation = snapshot.changeset.files.get(&w.path).cloned();
+        entries.push(Entry::from_worktree(w.clone(), annotation));
     }
-    snapshot.entries = load_toggled(snapshot.entries, &input.repo, &input.toggled_dirs);
-    snapshot.ignored_pending = false;
-    snapshot.touched = None;
-    snapshot
+    let entries = load_toggled(entries, &input.repo, &input.toggled_dirs);
+    WorldSnapshot { entries, ignored_pending: false, touched: None, ..snapshot }
 }
 
 /// The active scope's changeset and, on `branch`, its base.
@@ -341,15 +341,14 @@ pub(crate) fn all_files_entries(
         Entry::from_worktree(w, annotation)
     };
     let untracked = parts.untracked(&input.repo)?.to_vec();
-    let deferred = parts.defer_ignored && parts.ignored.listed.is_none();
-    let ignored = if deferred { &[] } else { parts.ignored(&input.repo)? };
+    let ignored = if parts.ignored_deferred() { &[] } else { parts.ignored(&input.repo)? };
     let listed = git::all_files_given(&input.repo, &untracked, ignored)?;
     let entries: Vec<Entry> = listed.into_iter().map(&to_entry).collect();
     Ok(load_toggled(entries, &input.repo, &input.toggled_dirs))
 }
 
-/// `entries` with each expanded ignored directory's children loaded and each collapsed one's
-/// dropped, read from disk; sorted by path, which a path-limited rebuild merges into in one pass.
+/// `entries` with each expanded ignored directory's children read from disk again, and no other
+/// entry inside an ignored directory; sorted by path, which a path-limited rebuild merges into.
 pub(crate) fn load_toggled(
     mut entries: Vec<Entry>,
     repo: &Path,
@@ -357,27 +356,22 @@ pub(crate) fn load_toggled(
 ) -> Vec<Entry> {
     let ignored_dirs: HashSet<String> =
         entries.iter().filter(|e| e.is_dir && e.ignored).map(|e| e.path.clone()).collect();
-    // A loaded child goes with any collapsed ignored directory above it.
-    let collapsed_above = |path: &str| {
+    // Children loaded before go; each expanded directory reads its own again below.
+    let inside_ignored = |path: &str| {
         let mut at = path;
         while let Some((parent, _)) = at.rsplit_once('/') {
-            if ignored_dirs.contains(parent) && !toggled.contains(parent) {
+            if ignored_dirs.contains(parent) {
                 return true;
             }
             at = parent;
         }
         false
     };
-    entries.retain(|e| !e.ignored || !collapsed_above(&e.path));
-    let present: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
-    let has_children = |dir: &str| {
-        let prefix = format!("{dir}/");
-        present.iter().any(|p| p.starts_with(&prefix))
-    };
+    entries.retain(|e| !e.ignored || !inside_ignored(&e.path));
     let mut i = 0;
     while i < entries.len() {
         let e = &entries[i];
-        if e.is_dir && e.ignored && toggled.contains(&e.path) && !has_children(&e.path) {
+        if e.is_dir && e.ignored && toggled.contains(&e.path) {
             let path = e.path.clone();
             let children = git::list_ignored_dir(repo, &path);
             entries.extend(children.into_iter().map(|w| Entry::from_worktree(w, None)));
@@ -624,10 +618,8 @@ pub struct WorldCompletion {
     pub input: WorldInput,
     pub reveal: bool,
     pub snapshot: Option<Result<WorldSnapshot>>,
-    /// What the job re-read, so a failure can retry exactly that.
+    /// What the job re-read, so a failure can retry exactly that; a failed switch retries whole.
     pub refresh: Refresh,
-    /// Whether a switch asked for it, so a failure retries it whole.
-    pub switch: bool,
     /// How long the build took: the pacing budget's measure, which bounds its git's CPU.
     pub took: std::time::Duration,
 }
@@ -642,8 +634,7 @@ pub fn spawn(
         .name("world".into())
         .spawn(move || {
             git::sweep_dead_copies(&repo);
-            let mut worker = Worker { tx: Some(tx.clone()), ..Worker::default() };
-            worker.parts.defer_ignored = true;
+            let mut worker = Worker::new(tx);
             while let Ok(mut job) = rx.recv() {
                 while let Ok(next) = rx.try_recv() {
                     let mut refresh = job.refresh;
@@ -651,19 +642,7 @@ pub fn spawn(
                     let (reveal, switch) = (job.reveal || next.reveal, job.switch || next.switch);
                     job = WorldJob { reveal, refresh, switch, ..next };
                 }
-                let started = std::time::Instant::now();
-                let snapshot =
-                    worker.refresh(job.generation, &job.input, job.refresh.clone(), job.switch);
-                let done = WorldCompletion {
-                    generation: job.generation,
-                    input: job.input,
-                    reveal: job.reveal,
-                    snapshot,
-                    refresh: job.refresh,
-                    switch: job.switch,
-                    took: started.elapsed(),
-                };
-                if tx.send(done).is_err() {
+                if !worker.run(job) {
                     break;
                 }
             }
@@ -677,113 +656,147 @@ struct Walk {
     /// Bumped by every full refresh, so a walk from before one never lands.
     epoch: u64,
     running: bool,
-    /// What a finished walk read, and its epoch, until the worker takes it.
-    listed: Option<(u64, Vec<git::IgnoredEntry>)>,
+    /// What a finished walk read, until the worker takes it; a full refresh drops it.
+    listed: Option<Vec<git::WorktreeEntry>>,
     /// The newest build waiting on the walk: its job's generation and input, which it lands as.
     pending: Option<(u64, WorldInput, WorldSnapshot)>,
 }
 
+fn lock(walk: &Mutex<Walk>) -> std::sync::MutexGuard<'_, Walk> {
+    walk.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Walk the ignored entries off the worker, then land the build waiting on them, or keep the
+/// listing for the next build.
+fn spawn_walk(
+    shared: Arc<Mutex<Walk>>,
+    tx: crate::wake::Sender<WorldCompletion>,
+    repo: PathBuf,
+    mut epoch: u64,
+) {
+    std::thread::spawn(move || {
+        let (listed, mut walk) = loop {
+            let listed = git::ignored_listing(&repo, &[]);
+            let mut walk = lock(&shared);
+            if walk.epoch == epoch {
+                break (listed, walk);
+            }
+            // Outdated by a full refresh: walk again only if a build waits on it.
+            if walk.pending.is_none() {
+                walk.running = false;
+                return;
+            }
+            epoch = walk.epoch;
+        };
+        walk.running = false;
+        let Some((generation, input, built)) = walk.pending.take() else {
+            walk.listed = listed.ok();
+            return;
+        };
+        // A failed walk fails its build, which the pacer retries whole on a backoff.
+        let (snapshot, refresh) = match listed {
+            Ok(listed) => {
+                walk.listed = Some(listed.clone());
+                drop(walk);
+                (Ok(with_ignored(built, &input, &listed)), Refresh::default())
+            }
+            Err(e) => (Err(e), Refresh::Full),
+        };
+        let (reveal, snapshot, took) = (false, Some(snapshot), std::time::Duration::ZERO);
+        let _ = tx.send(WorldCompletion { generation, input, reveal, snapshot, refresh, took });
+    });
+}
+
 /// What the worker keeps between jobs: its last build, what the index staged when it ran, the
 /// parts full builds share, and what moved since the last build.
-#[derive(Default)]
 struct Worker {
     last: Option<(WorldInput, WorldSnapshot)>,
     staged: Option<u64>,
     parts: Parts,
     owed: Refresh,
     walk: Arc<Mutex<Walk>>,
-    /// Where a walk lands the build waiting on it.
-    tx: Option<crate::wake::Sender<WorldCompletion>>,
+    /// Where a build lands, and a walk's follow-up after it.
+    tx: crate::wake::Sender<WorldCompletion>,
 }
 
 impl Worker {
-    /// Hear what a refresh says moved; a full one also outdates a running walk.
+    fn new(tx: crate::wake::Sender<WorldCompletion>) -> Self {
+        let parts = Parts { defer_ignored: true, ..Parts::default() };
+        let (last, staged, owed, walk) = (None, None, Refresh::default(), Arc::default());
+        Self { last, staged, parts, owed, walk, tx }
+    }
+
+    /// Build one job and send its completion; `false` once nobody listens.
+    fn run(&mut self, job: WorldJob) -> bool {
+        let started = std::time::Instant::now();
+        let built = self.refresh(&job.input, job.refresh.clone(), job.switch);
+        let shared = Arc::clone(&self.walk);
+        // Held through the send, so a walk's follow-up never lands before the build it completes.
+        let mut walk = lock(&shared);
+        let snapshot = built.map(|b| b.and_then(|b| self.settle_ignored(&mut walk, &job, b)));
+        match &snapshot {
+            Some(Ok(built)) => self.last = Some((job.input.clone(), built.clone())),
+            // A failed build saw nothing: the next one reads everything again.
+            Some(Err(_)) => self.last = None,
+            None => {}
+        }
+        // A failed switch still owes its view, so its retry builds whole.
+        let failed = job.switch && matches!(snapshot, Some(Err(_)));
+        let done = WorldCompletion {
+            generation: job.generation,
+            input: job.input,
+            reveal: job.reveal,
+            snapshot,
+            refresh: if failed { Refresh::Full } else { job.refresh },
+            took: started.elapsed(),
+        };
+        self.tx.send(done).is_ok()
+    }
+
+    /// Hear what a refresh says moved; a full one also outdates the walk.
     fn hear(&mut self, refresh: &Refresh) {
         self.parts.note(refresh);
         if refresh.is_full() {
-            self.walk().epoch += 1;
+            let mut walk = lock(&self.walk);
+            walk.epoch += 1;
+            walk.listed = None;
         }
     }
 
-    fn walk(&self) -> std::sync::MutexGuard<'_, Walk> {
-        self.walk.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Take a finished walk's listing, unless a full refresh dropped it since; start one if none ran.
-    fn adopt_walk(&mut self, repo: &Path, start: bool) {
-        let mut walk = self.walk.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((epoch, listed)) = walk.listed.take()
-            && epoch == walk.epoch
-        {
+    /// Take a finished walk's listing; with `start`, walk when nothing is listed or walking.
+    fn adopt_walk(&mut self, walk: &mut Walk, repo: &Path, start: bool) {
+        if let Some(listed) = walk.listed.take() {
             self.parts.ignored.listed.get_or_insert(listed);
         }
-        let Some(tx) = self.tx.clone() else { return };
-        if !start || walk.running || self.parts.ignored.listed.is_some() {
-            return;
+        if start && !walk.running && self.parts.ignored.listed.is_none() {
+            walk.running = true;
+            spawn_walk(Arc::clone(&self.walk), self.tx.clone(), repo.to_path_buf(), walk.epoch);
         }
-        walk.running = true;
-        let (shared, repo, mut epoch) = (Arc::clone(&self.walk), repo.to_path_buf(), walk.epoch);
-        std::thread::spawn(move || {
-            loop {
-                let listed = git::ignored_listing(&repo, &[]);
-                let mut walk = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                // Outdated by a full refresh: walk again only if a build waits on it.
-                if walk.epoch != epoch && walk.pending.is_some() {
-                    epoch = walk.epoch;
-                    continue;
-                }
-                walk.running = false;
-                let Some((generation, input, built)) =
-                    walk.pending.take().filter(|_| walk.epoch == epoch)
-                else {
-                    walk.listed = listed.ok().filter(|_| walk.epoch == epoch).map(|l| (epoch, l));
-                    return;
-                };
-                // A failed walk fails its build, which the pacer retries whole on a backoff.
-                let (snapshot, refresh) = match listed {
-                    Ok(listed) => {
-                        let built = with_ignored(built, &input, &listed);
-                        walk.listed = Some((epoch, listed));
-                        (Ok(built), Refresh::default())
-                    }
-                    Err(e) => (Err(e), Refresh::Full),
-                };
-                drop(walk);
-                let (reveal, switch, took) = (false, false, std::time::Duration::ZERO);
-                let snapshot = Some(snapshot);
-                let done =
-                    WorldCompletion { generation, input, reveal, snapshot, refresh, switch, took };
-                let _ = tx.send(done);
-                return;
-            }
-        });
     }
 
     /// A build waiting on ignored entries gets them once walked; else the walk lands it later.
     fn settle_ignored(
         &mut self,
-        generation: u64,
-        input: &WorldInput,
+        walk: &mut Walk,
+        job: &WorldJob,
         built: WorldSnapshot,
     ) -> Result<WorldSnapshot> {
         if !built.ignored_pending {
             return Ok(built);
         }
-        self.walk().pending = Some((generation, input.clone(), built.clone()));
-        self.adopt_walk(&input.repo, true);
+        self.adopt_walk(walk, &job.input.repo, true);
         if self.parts.ignored.listed.is_none() {
+            walk.pending = Some((job.generation, job.input.clone(), built.clone()));
             return Ok(built);
         }
-        self.walk().pending = None;
-        let ignored = self.parts.ignored(&input.repo)?.to_vec();
-        Ok(with_ignored(built, input, &ignored))
+        let ignored = self.parts.ignored(&job.input.repo)?.to_vec();
+        Ok(with_ignored(built, &job.input, &ignored))
     }
 
     /// Run one refresh: only what moved when the last build is of the same input, else in full.
     /// `None` when nothing needs re-reading, and on the `PR` tab.
     fn refresh(
         &mut self,
-        generation: u64,
         input: &WorldInput,
         refresh: Refresh,
         switch: bool,
@@ -820,45 +833,27 @@ impl Worker {
             input.toggled_dirs.iter().any(|d| git::under_or_eq(p, d) || git::under_or_eq(d, p))
         };
         let last = self.last.as_ref().filter(|(of, _)| of == input).map(|(_, built)| built);
-        let narrow = match (last, &refresh) {
-            (Some(last), Refresh::Paths { paths, .. }) if !paths.iter().any(in_expanded) => {
-                // A switch back to the last build's input, with nothing moved since, is that build.
-                if paths.is_empty() {
-                    if !switch {
-                        return None;
-                    }
-                    Some(Ok(WorldSnapshot { touched: None, ..last.clone() }))
-                } else {
-                    match rebuild_paths(input, last, paths) {
-                        // A failed narrow read is retried at once as a full build.
-                        Some(Err(e)) => {
-                            logln!("path-limited refresh failed, rebuilding in full: {e:#}");
-                            None
-                        }
-                        read => read,
-                    }
-                }
+        if let (Some(last), Refresh::Paths { paths, .. }) = (last, &refresh)
+            && !paths.iter().any(in_expanded)
+        {
+            // A switch back to the last build's input, with nothing moved since, is that build.
+            if paths.is_empty() {
+                return switch.then(|| Ok(WorldSnapshot { touched: None, ..last.clone() }));
             }
-            _ => None,
-        };
-        let full = narrow.is_none();
-        let fingerprint =
-            full.then(|| fingerprint.unwrap_or_else(|| git::staged_fingerprint(&input.repo).ok()));
-        let built = narrow.unwrap_or_else(|| {
-            // The walk starts first, so it runs beside the build.
-            self.adopt_walk(&input.repo, input.tab == Tab::AllFiles);
-            build_with(input, &mut self.parts)
-        });
-        let built = built.and_then(|built| self.settle_ignored(generation, input, built));
-        match &built {
-            Ok(built) => {
-                if let Some(fingerprint) = fingerprint {
-                    self.staged = fingerprint;
-                }
-                self.last = Some((input.clone(), built.clone()));
+            match rebuild_paths(input, last, paths) {
+                // A failed narrow read is retried at once as a full build.
+                Some(Err(e)) => logln!("path-limited refresh failed, rebuilding in full: {e:#}"),
+                Some(read) => return Some(read),
+                None => {}
             }
-            // A failed build saw nothing: the next one reads everything again.
-            Err(_) => self.last = None,
+        }
+        let staged = fingerprint.unwrap_or_else(|| git::staged_fingerprint(&input.repo).ok());
+        // The walk starts first, so it runs beside the build.
+        let shared = Arc::clone(&self.walk);
+        self.adopt_walk(&mut lock(&shared), &input.repo, input.tab == Tab::AllFiles);
+        let built = build_with(input, &mut self.parts);
+        if built.is_ok() {
+            self.staged = staged;
         }
         Some(built)
     }
@@ -866,8 +861,25 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::Refresh;
+    use super::{Part, Refresh};
+    use crate::git::WorktreeEntry;
     use crate::watch::{Batch, GitChange};
+
+    #[test]
+    fn a_part_rereads_what_moved_and_keeps_no_duplicate() {
+        let ignored = |path: &str| WorktreeEntry { path: path.into(), ignored: true, is_dir: true };
+        let listed = Some(vec![ignored("gen"), ignored("new/x"), ignored("target")]);
+        let moved = ["new", "target/a.o"].map(String::from).into();
+        let mut part = Part { listed, moved };
+        // A narrow read under a path inside a collapsed directory lists that directory again.
+        let read = |paths: &[String]| {
+            assert_eq!(paths, ["new", "target/a.o"]);
+            Ok(vec![ignored("target")])
+        };
+        let listed = part.get(read, |w| w.path.as_str()).unwrap();
+        let paths: Vec<&str> = listed.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, ["gen", "target"]);
+    }
 
     fn batch(git: &[GitChange], worktree: &[&str], rescan: bool) -> Batch {
         Batch {

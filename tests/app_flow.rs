@@ -4647,7 +4647,6 @@ fn completion_for(app: &App, generation: u64) -> herdr_reviewr::world::WorldComp
         reveal: false,
         snapshot: Some(Ok(snapshot)),
         refresh: herdr_reviewr::world::Refresh::Full,
-        switch: false,
         took: std::time::Duration::ZERO,
     }
 }
