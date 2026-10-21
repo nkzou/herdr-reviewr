@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::config::DiffView;
+use crate::config::{DiffView, OnSend};
 use crate::diff::{DiffCache, FileDiff, RenderedKind, Row, View};
 use crate::export::{Agent, ExportTarget, format_review};
 use crate::file_list::{self, Entry, RowKind};
@@ -5153,9 +5153,25 @@ impl App {
 
     /// Export to one decided pane; only a delivery records it as `last used`.
     fn export_to_agent(&mut self, agent: &AgentChoice) {
-        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
+        let on_send =
+            self.plugin_config().map_or(OnSend::Focus, crate::config::PluginConfig::on_send);
+        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone(), on_send };
         if self.export(&target) {
             self.last_sent_pane = Some(agent.pane_id.clone());
+            if on_send == OnSend::Close {
+                self.close_own_pane();
+            }
+        }
+    }
+
+    /// Close this pane through herdr and quit; a failure keeps reviewr open and says so.
+    fn close_own_pane(&mut self) {
+        match self.herdr.ids.pane.as_deref().map(herdr::close_pane) {
+            Some(Ok(())) => self.should_quit = true,
+            failed => {
+                logln!("close own pane: {failed:?}");
+                self.status.push_str(", close failed");
+            }
         }
     }
 

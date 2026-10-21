@@ -10,8 +10,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use common::{Repo, UnifiedRow as _, app_on, fake_herdr, herdr_calls, herdr_error};
+use common::{Repo, UnifiedRow as _, app_on, fake_herdr, fixture, herdr_calls, herdr_error};
 use herdr_reviewr::app::{App, Focus, Mode};
+use herdr_reviewr::config::plugin_config_in;
 use herdr_reviewr::keymap::Keymap;
 use herdr_reviewr::ui;
 use herdr_reviewr::{handle_key, handle_mouse};
@@ -458,6 +459,55 @@ fn a_long_review_sends_whole_and_one_over_the_cap_refuses() {
         "sent 1 comment to claude"
     };
     assert_eq!(app.status, want);
+}
+
+/// `on_send` picks what follows a delivery: `stay` keeps the focus, `close` closes this pane.
+#[test]
+fn on_send_picks_what_follows_a_delivered_send() {
+    if !in_child() {
+        let dir = run_in_child("on_send_picks_what_follows_a_delivered_send", true);
+        assert!(herdr_calls(dir.path()).contains("pane close w8:p9"), "the child closed nothing");
+        return;
+    }
+
+    let fake_dir = fixture_dir();
+    let _socket = FakeSocket::serve(&socket_path());
+    agents(&fake_dir, ONE_AGENT);
+    let (_repo, mut app) = app();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    let config_dir = TempDir::new().unwrap();
+    let on_send = |app: &mut App, value: &str| {
+        fs::write(config_dir.path().join("config.toml"), format!("on_send = \"{value}\"\n"))
+            .unwrap();
+        app.set_plugin_config(plugin_config_in(config_dir.path()).unwrap());
+    };
+
+    // `stay` delivers and leaves the focus on reviewr.
+    on_send(&mut app, "stay");
+    write_comment(&mut app, "one");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert!(app.store.is_empty(), "a stay send still delivers");
+    assert!(!herdr_calls(&fake_dir).contains("agent focus"), "stay focuses nothing");
+    assert!(!app.should_quit);
+
+    // `close` that herdr refuses keeps reviewr open and says so.
+    on_send(&mut app, "close");
+    fs::write(fixture(&fake_dir, "closefail", "w8:p9", ""), herdr_error("internal")).unwrap();
+    write_comment(&mut app, "two");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert!(app.store.is_empty(), "a failed close never un-sends");
+    assert_eq!(app.status, "sent 1 comment to claude, close failed");
+    assert!(!app.should_quit);
+
+    // `close` focuses the agent first, then closes this pane and quits.
+    fs::remove_file(fixture(&fake_dir, "closefail", "w8:p9", "")).unwrap();
+    write_comment(&mut app, "three");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    let calls = herdr_calls(&fake_dir);
+    let tail: Vec<&str> = calls.lines().rev().take(2).collect();
+    assert_eq!(tail, ["pane close w8:p9", "agent focus w8:p1"], "focus, then close");
+    assert!(app.should_quit, "a closed pane quits");
 }
 
 /// No `HERDR_SOCKET_PATH` is no herdr to send to.

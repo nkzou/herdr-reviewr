@@ -199,6 +199,7 @@ navigator_position = "bottom"       # right | bottom | left | top
 toggle_placement = "overlay"        # split | overlay | zoomed | tab
 toggle_direction = "down"           # right | down, for split
 auto_open = false
+on_send = "close"                   # focus | stay | close
 editor = "code -g {file}:{line}"
 url_opener = "browser-bridge --new-tab {url}"
 review_prefix = "Fix each comment, then run the tests."
@@ -255,6 +256,12 @@ through a shell, so don't use `ssh host open {url}`.
 `review_prefix` goes above your comments on every send and copy. It arrives as pasted text, so
 Claude Code won't run a `/command` in it. To run one, type it in the agent's input before you
 press `s`.
+
+### After a send
+
+`on_send` sets what happens after `s` delivers the comments. `focus` (the default) moves the
+keyboard to the agent pane. `stay` keeps it on reviewr. `close` moves it to the agent pane, then
+closes reviewr. Use `close` with `overlay`: herdr then restores the layout under the overlay.
 
 ### Keybindings
 
