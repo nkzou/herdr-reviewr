@@ -10,7 +10,7 @@ use herdr_reviewr::git::{
     DiffSides, ResolvedBase, abbreviate_oid, all_files, changed_between, changed_from,
     checked_out_branch, default_branch_name, delete_base_pick, diff_sides, list_branches,
     merge_base as merge_base_oid, read_base_pick, read_baseline_ref, resolve_base, resolve_commit,
-    snapshot_worktree, write_base_pick, write_baseline_ref,
+    snapshot_worktree, untracked_files, write_base_pick, write_baseline_ref,
 };
 use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
 use herdr_reviewr::world::{WorldInput, build_changed};
@@ -1842,4 +1842,63 @@ fn concurrent_snapshots_of_one_worktree_all_land_the_same_tree() {
         .map(|tree| tree.expect("a snapshot failed"))
         .collect();
     assert!(trees.windows(2).all(|w| w[0] == w[1]), "snapshots disagree: {trees:?}");
+}
+
+/// The status read lists exactly what `ls-files --others` lists, inside new directories too.
+#[test]
+fn untracked_files_match_the_whole_walk() {
+    let r = Repo::init();
+    r.write(".gitignore", "ign/\n*.log\n");
+    r.write("t/f", "1\n");
+    r.commit_all("init");
+    for (path, body) in [
+        ("a/b/c/new.txt", "x\n"),
+        ("a/b/c/z.log", "y\n"),
+        ("a/top", "z\n"),
+        ("onlyign/q.log", "l\n"),
+        ("ign/x/f", "i\n"),
+        ("t/new", "n\n"),
+        ("sp/we ird \u{f1}.txt", "s\n"),
+    ] {
+        r.write(path, body);
+    }
+    let mut walked: Vec<String> = r
+        .git(&["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z"])
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    walked.sort();
+    let mut listed = untracked_files(r.path()).unwrap();
+    listed.sort();
+    assert_eq!(listed, walked);
+}
+
+/// A snapshot that stages only what status names lands the tree a whole `add -A` would.
+#[test]
+fn a_snapshot_stages_exactly_what_a_whole_add_would() {
+    let r = Repo::init();
+    r.write("keep.txt", "k\n");
+    r.write("edit.txt", "1\n");
+    r.write("gone.txt", "g\n");
+    r.commit_all("init");
+    r.write("edit.txt", "2\n");
+    std::fs::remove_file(r.path().join("gone.txt")).unwrap();
+    r.write("new/deep/file.txt", "n\n");
+    r.write("loose.txt", "l\n");
+    let tree = snapshot_worktree(r.path()).unwrap();
+    let scratch = r.path().join(".git/scratch-index");
+    let whole = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(r.path())
+            .env("GIT_INDEX_FILE", &scratch)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    whole(&["read-tree", "HEAD"]);
+    whole(&["add", "-A"]);
+    assert_eq!(tree, whole(&["write-tree"]));
 }
