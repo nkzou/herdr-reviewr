@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`on_send`**: set what happens after a send. `focus` moves the keyboard to the agent (the default, as before). `stay` keeps it on reviewr. `close` moves it to the agent, then closes reviewr, so an `overlay` pane does not stay open after a send.
+
 ## [0.48.0] — 2026-10-19
 
 ### Added

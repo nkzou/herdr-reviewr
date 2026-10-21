@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use crate::config::OnSend;
 use crate::herdr;
 use crate::model::Comment;
 
@@ -169,11 +170,12 @@ mod clipboard {
     }
 }
 
-/// One chosen agent pane: fill its input in one socket request, then focus it.
+/// One chosen agent pane: fill its input in one socket request, then focus it unless told to stay.
 #[derive(Clone, Debug)]
 pub struct Agent {
     pub pane: String,
     pub name: String,
+    pub on_send: OnSend,
 }
 
 impl ExportTarget for Agent {
@@ -198,7 +200,9 @@ impl ExportTarget for Agent {
     fn export(&self, text: &str) -> Result<()> {
         herdr::send_text(&self.pane, text)?;
         // A focus failure must not fail a delivered export.
-        let _ = herdr::focus(&self.pane);
+        if self.on_send != OnSend::Stay {
+            let _ = herdr::focus(&self.pane);
+        }
         Ok(())
     }
 }
@@ -229,7 +233,11 @@ mod tests {
     #[test]
     fn export_confirmations_name_the_actual_result_and_pluralize_comments() {
         // The agent line names the pane it addressed.
-        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
+        let agent = Agent {
+            pane: "w8:p1".into(),
+            name: "release-bot".into(),
+            on_send: crate::config::OnSend::Focus,
+        };
         assert_eq!(agent.success_message(1), "sent 1 comment to release-bot");
         assert_eq!(agent.success_message(2), "sent 2 comments to release-bot");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
@@ -239,7 +247,11 @@ mod tests {
     #[test]
     fn a_failed_send_or_copy_says_what_to_do() {
         use crate::herdr::{HerdrError as H, SendError as S};
-        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
+        let agent = Agent {
+            pane: "w8:p1".into(),
+            name: "release-bot".into(),
+            on_send: crate::config::OnSend::Focus,
+        };
         let rows = [
             (S::Herdr(H::PaneGone), "release-bot closed, press y to copy"),
             (S::AtPrompt("codex".into()), "answer codex's prompt first"),

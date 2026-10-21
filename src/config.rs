@@ -60,7 +60,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 15] = [
+const PLUGIN_CONFIG_KEYS: [&str; 16] = [
     "theme",
     "default_scope",
     "markdown_view",
@@ -69,6 +69,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 15] = [
     "toggle_placement",
     "toggle_direction",
     "auto_open",
+    "on_send",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -168,6 +169,18 @@ impl ToggleDirection {
     }
 }
 
+/// What reviewr does after a send delivers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnSend {
+    /// Focus the agent pane.
+    #[default]
+    Focus,
+    /// Keep the focus on reviewr.
+    Stay,
+    /// Focus the agent pane, then close the reviewr pane.
+    Close,
+}
+
 /// One validated snapshot of `config.toml` in the resolved config directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfig {
@@ -179,6 +192,7 @@ pub struct PluginConfig {
     toggle_placement: TogglePlacement,
     toggle_direction: ToggleDirection,
     auto_open: bool,
+    on_send: OnSend,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -199,6 +213,7 @@ impl Default for PluginConfig {
             toggle_placement: TogglePlacement::Split,
             toggle_direction: ToggleDirection::Right,
             auto_open: true,
+            on_send: OnSend::Focus,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -244,6 +259,10 @@ impl PluginConfig {
 
     pub fn auto_open(&self) -> bool {
         self.auto_open
+    }
+
+    pub fn on_send(&self) -> OnSend {
+        self.on_send
     }
 
     pub fn github_host(&self) -> Option<&str> {
@@ -455,6 +474,16 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
             value.as_bool().ok_or_else(|| value_error(path, value, "auto_open", "a boolean"))?;
+    }
+    if let Some(value) = table.get("on_send") {
+        config.on_send = match string_value(path, "on_send", value, "one of focus, stay, close")? {
+            "focus" => OnSend::Focus,
+            "stay" => OnSend::Stay,
+            "close" => OnSend::Close,
+            _ => {
+                return Err(value_error(path, value, "on_send", "one of focus, stay, close"));
+            }
+        };
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -706,7 +735,7 @@ pub(crate) fn plugin_config_from_herdr() -> Result<PluginConfig, PluginConfigErr
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DiffView, MarkdownView, NavigatorPosition, PluginConfig, ToggleDirection,
+        Config, DiffView, MarkdownView, NavigatorPosition, OnSend, PluginConfig, ToggleDirection,
         TogglePlacement,
     };
     use crate::keymap::KeyCode;
@@ -778,6 +807,7 @@ mod tests {
         assert_eq!(config.toggle_placement(), TogglePlacement::Split);
         assert_eq!(config.toggle_direction(), ToggleDirection::Right);
         assert!(config.auto_open());
+        assert_eq!(config.on_send(), OnSend::Focus);
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
         assert_eq!(config.markdown_view(), MarkdownView::Source);
@@ -796,6 +826,7 @@ mod tests {
                 "toggle_placement = \"overlay\"\n",
                 "toggle_direction = \"down\"\n",
                 "auto_open = false\n",
+                "on_send = \"close\"\n",
                 "github_host = \"GitHub.Example.COM\"\n",
                 "markdown_view = \"rendered\"\n",
                 "diff_view = \"split\"\n",
@@ -811,6 +842,7 @@ mod tests {
         assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
         assert!(!config.auto_open());
+        assert_eq!(config.on_send(), OnSend::Close);
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -892,6 +924,8 @@ mod tests {
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
             ("auto_open = \"yes\"\n", "`auto_open`"),
+            ("on_send = \"quit\"\n", "`on_send`"),
+            ("on_send = true\n", "`on_send`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),
