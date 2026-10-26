@@ -131,6 +131,16 @@ pub fn git_dirs(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((dir.canonicalize().ok()?, common.canonicalize().ok()?))
 }
 
+/// Whether `core.fsmonitor` names git's builtin daemon, not a hook program or nothing.
+pub fn builtin_fsmonitor(repo: &Path) -> bool {
+    git_line(repo, &["config", "--type=bool", "--get", "core.fsmonitor"]).as_deref() == Some("true")
+}
+
+/// Start the builtin fsmonitor daemon, as any `git status` under `core.fsmonitor` would.
+pub fn start_fsmonitor(repo: &Path) -> Result<()> {
+    git(repo, &["fsmonitor--daemon", "start"]).map(drop)
+}
+
 /// The global ignore file git reads: `core.excludesFile`, else git's default under the XDG dir.
 pub fn global_excludes(repo: &Path) -> Option<PathBuf> {
     if let Some(path) = git_line(repo, &["config", "--path", "core.excludesFile"]) {

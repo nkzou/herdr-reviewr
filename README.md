@@ -336,6 +336,8 @@ On Windows, point it at the plugin's own `bin` folder.
 - **The PR tab** supports GitHub, GitLab, and Azure DevOps only. A merged or closed PR shows as
   history. Each comment list shows its newest 100.
 - **A background pane** catches up 30 seconds after a change, or at once when shown.
+- **Linux watches each folder with inotify**, which a large repo with many worktrees can run out
+  of. Set `core.fsmonitor = true` in the repo: reviewr then reads changes from git's own daemon.
 - **A rename can pair with the wrong file** until you press `r`.
 - **Comments live only in the pane.** Closing it loses unsent ones. Send delivers all or none.
 - **Comments don't follow moved code.** reviewr marks them stale instead of dropping them.

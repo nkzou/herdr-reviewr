@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **`on_send`**: set what happens after a send. `focus` moves the keyboard to the agent (the default, as before). `stay` keeps it on reviewr. `close` moves it to the agent, then closes reviewr, so an `overlay` pane does not stay open after a send.
 
+### Changed
+- **Large repos on Linux use git's fsmonitor**: where `core.fsmonitor = true`, a pane reads worktree changes from git's daemon, and holds inotify watches on git's files and on at most 100 changed folders instead of one per folder. It asks the daemon on an edit in a changed folder, a git operation, a key or click, a turn's start or end, or when shown, never on a timer. An edit in a folder with no changes yet shows at the next of these. Many worktrees of one large repo no longer use up the inotify limit and stop git's own daemons from starting.
+
 ## [0.48.0] — 2026-10-19
 
 ### Added

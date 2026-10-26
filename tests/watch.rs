@@ -762,3 +762,186 @@ fn a_watcher_out_of_inotify_watches_reports_itself_unavailable() {
         }
     }
 }
+
+/// A fake of git's fsmonitor daemon on its socket: each ask takes the next queued answer, else
+/// "nothing changed".
+#[cfg(target_os = "linux")]
+struct FakeDaemon {
+    answers: Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+    asks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(target_os = "linux")]
+impl FakeDaemon {
+    fn serve(socket: &std::path::Path) -> Self {
+        use std::io::{Read, Write};
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let daemon = Self { answers: Arc::default(), asks: Arc::default() };
+        let (answers, asks) = (Arc::clone(&daemon.answers), Arc::clone(&daemon.asks));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                // The request: pkt-lines up to the flush packet.
+                loop {
+                    let mut header = [0; 4];
+                    if stream.read_exact(&mut header).is_err() {
+                        break;
+                    }
+                    let len =
+                        usize::from_str_radix(std::str::from_utf8(&header).unwrap(), 16).unwrap();
+                    if len == 0 {
+                        break;
+                    }
+                    let mut body = vec![0; len - 4];
+                    stream.read_exact(&mut body).unwrap();
+                }
+                asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answer =
+                    answers.lock().unwrap().pop_front().unwrap_or_else(|| b"tok\0".to_vec());
+                let mut wire = format!("{:04x}", answer.len() + 4).into_bytes();
+                wire.extend(answer);
+                wire.extend(b"0000");
+                let _ = stream.write_all(&wire);
+            }
+        });
+        daemon
+    }
+
+    fn answer(&self, payload: &[u8]) {
+        self.answers.lock().unwrap().push_back(payload.to_vec());
+    }
+
+    fn asks(&self) -> usize {
+        self.asks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Batches merged until one meets `done`, within five seconds.
+#[cfg(target_os = "linux")]
+fn until(rx: &Receiver<WatchEvent>, done: impl Fn(&Batch) -> bool) -> Batch {
+    let mut merged = Batch::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(&merged) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(WatchEvent::Batch(b)) => {
+                merged.worktree.extend(b.worktree);
+                merged.git.extend(b.git);
+                merged.rescan |= b.rescan;
+            }
+            Ok(WatchEvent::Ready) => {}
+            Ok(WatchEvent::Unavailable(reason)) => panic!("watcher unavailable: {reason}"),
+            Err(e) => panic!("{e} at {merged:?}"),
+        }
+    }
+    merged
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn under_gits_fsmonitor_daemon_events_ask_it_and_no_clock_does() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = repo_with(&["a.rs", "cold/x.rs", "src/deep/f.rs"]);
+    r.git(&["config", "core.fsmonitor", "true"]);
+    let daemon = FakeDaemon::serve(&r.path().join(".git/fsmonitor--daemon.ipc"));
+    let (tx, rx) = channel(&Waker::detached());
+    let mut watch = Watch::start(r.path(), None, tx, None);
+    let ready = rx.recv_timeout(Duration::from_secs(10)).expect("the start");
+    assert!(matches!(ready, WatchEvent::Ready), "{ready:?}");
+    assert_eq!(daemon.asks(), 1, "the start asked the daemon");
+
+    // A write outside every watched folder is unseen, and nothing asks the daemon on a clock.
+    r.write("cold/x.rs", "two\n");
+    while let Ok(event) = rx.recv_timeout(Duration::from_millis(1200)) {
+        if let WatchEvent::Batch(b) = event {
+            assert!(!b.worktree.contains("cold/x.rs"), "inotify saw the tree: {b:?}");
+        }
+    }
+    assert_eq!(daemon.asks(), 1, "an idle pane asks nothing");
+
+    // An ask (a key, a turn) takes what the daemon reports, a folder by its name.
+    r.write("new/b.rs", "x\n");
+    daemon.answer(b"tok\0cold/x.rs\0new/\0");
+    watch.ask();
+    let batch = until(&rx, |b| b.worktree.contains("cold/x.rs"));
+    assert!(paths(&batch).contains("new"), "{batch:?}");
+
+    // The root is watched: a write there reports itself and asks for the rest.
+    daemon.answer(b"tok\0cold/x.rs\0");
+    r.write("a.rs", "two\n");
+    let batch = until(&rx, |b| b.worktree.contains("a.rs") && b.worktree.contains("cold/x.rs"));
+    assert!(batch.worktree.contains("cold/x.rs"), "{batch:?}");
+
+    // A changed file's folder is watched, so an edit there arrives at once.
+    watch.set_changed(["src/deep/f.rs"]);
+    std::thread::sleep(Duration::from_millis(100));
+    r.write("src/deep/f.rs", "two\n");
+    assert!(
+        until(&rx, |b| b.worktree.contains("src/deep/f.rs")).worktree.contains("src/deep/f.rs")
+    );
+
+    // An answer of everything rereads everything.
+    daemon.answer(b"tok\0/\0");
+    watch.ask();
+    assert!(until(&rx, |b| b.rescan).rescan);
+
+    // git's own files still report through inotify.
+    r.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    assert!(until(&rx, |b| b.git.contains(&GitChange::Refs)).git.contains(&GitChange::Refs));
+
+    // Shown again, the pane asks what changed while it was hidden.
+    watch.set_visible(false);
+    std::thread::sleep(Duration::from_millis(100));
+    let asked = daemon.asks();
+    watch.set_visible(true);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(daemon.asks(), asked + 1, "shown, it asks once");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_repo_without_core_fsmonitor_never_asks_a_daemon() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = repo_with(&["a.rs"]);
+    let daemon = FakeDaemon::serve(&r.path().join(".git/fsmonitor--daemon.ipc"));
+    let (tx, rx) = channel(&Waker::detached());
+    let _watch = Watch::start(r.path(), None, tx, None);
+    let ready = rx.recv_timeout(Duration::from_secs(10)).expect("the start");
+    assert!(matches!(ready, WatchEvent::Ready), "{ready:?}");
+    r.write("a.rs", "two\n");
+    assert!(until(&rx, |b| b.worktree.contains("a.rs")).worktree.contains("a.rs"), "inotify");
+    assert_eq!(daemon.asks(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_real_fsmonitor_daemon_reports_edits_and_new_folders() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = repo_with(&["a.rs"]);
+    r.git(&["config", "core.fsmonitor", "true"]);
+    // An older git has no Linux daemon: then the watcher keeps inotify, which other tests cover.
+    let started = std::process::Command::new("git")
+        .arg("-C")
+        .arg(r.path())
+        .args(["fsmonitor--daemon", "start"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !started {
+        return;
+    }
+    let (tx, rx) = channel(&Waker::detached());
+    let watch = Watch::start(r.path(), None, tx, None);
+    let ready = rx.recv_timeout(Duration::from_secs(10)).expect("the start");
+    assert!(matches!(ready, WatchEvent::Ready), "{ready:?}");
+    r.write("a.rs", "two\n");
+    assert!(until(&rx, |b| b.worktree.contains("a.rs")).worktree.contains("a.rs"));
+    r.write("deep/er/c.rs", "x\n");
+    let batch = until(&rx, |b| b.worktree.iter().any(|p| p.starts_with("deep")));
+    assert!(batch.worktree.iter().any(|p| p.starts_with("deep")), "{batch:?}");
+    drop(watch);
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(r.path())
+        .args(["fsmonitor--daemon", "stop"])
+        .output();
+}

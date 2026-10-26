@@ -1990,6 +1990,11 @@ impl App {
         shown
     }
 
+    /// The changeset's paths, whose folders the watcher watches beside git's fsmonitor daemon.
+    pub fn changed_paths(&self) -> impl Iterator<Item = &str> {
+        self.changeset.files.keys().map(String::as_str)
+    }
+
     /// The branch scope's local base as a full ref, whose moves the watcher reports too.
     pub fn watched_refs(&self) -> std::collections::BTreeSet<String> {
         let base = self.branch_base.winner.as_ref().filter(|_| self.scope == Scope::Branch);

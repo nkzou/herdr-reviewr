@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
+use crate::fsmonitor::{Changes, Fsmonitor};
 use crate::schedule::Backoff;
 use crate::turn::{TurnFeed, TurnNews, Wrote};
 
@@ -17,6 +18,8 @@ pub(crate) const GATHER: Duration = Duration::from_millis(50);
 const CACHE_CAP: usize = 100_000;
 /// `FSEvents` can refuse a stream while others start in the same instant: a start retries this often.
 const START_ATTEMPTS: u32 = 5;
+/// The most changed folders the watcher watches beside git's fsmonitor daemon.
+const HOT_CAP: usize = 100;
 /// The name prefix of the cookie files watchman's git integration writes into the worktree.
 const WATCHMAN_COOKIE: &str = ".watchman-cookie-";
 
@@ -82,6 +85,10 @@ enum Msg {
     Shown(BTreeSet<String>),
     Refs(BTreeSet<String>),
     Visible(bool),
+    /// The changed folders, watched beside git's fsmonitor daemon.
+    Hot(BTreeSet<String>),
+    /// The reviewer acted, or a turn moved: ask git's fsmonitor daemon what changed.
+    Ask,
     /// The handle dropped; the channel never closes on its own, since notify's handler holds a sender.
     Stop,
 }
@@ -94,6 +101,7 @@ pub struct Watch {
     /// What the thread was last told, so a repeat sends nothing.
     shown: BTreeSet<String>,
     refs: BTreeSet<String>,
+    hot: BTreeSet<String>,
 }
 
 impl Drop for Watch {
@@ -121,7 +129,23 @@ impl Watch {
             logln!("watch thread failed to start: {e}");
             let _ = control.send(Msg::Stop);
         }
-        Self { control, shown: BTreeSet::new(), refs: BTreeSet::new() }
+        Self { control, shown: BTreeSet::new(), refs: BTreeSet::new(), hot: hot_folders([]) }
+    }
+
+    /// The changeset's files: their folders are watched beside git's fsmonitor daemon, so an
+    /// edit there asks the daemon at once.
+    pub fn set_changed<'a>(&mut self, files: impl IntoIterator<Item = &'a str>) {
+        let hot = hot_folders(files);
+        if hot != self.hot {
+            // The thread starts with the root alone, so an empty changeset sends nothing.
+            self.hot.clone_from(&hot);
+            let _ = self.control.send(Msg::Hot(hot));
+        }
+    }
+
+    /// The reviewer acted, or a turn moved: under git's fsmonitor daemon, ask it what changed.
+    pub fn ask(&self) {
+        let _ = self.control.send(Msg::Ask);
     }
 
     /// The ignored entries on screen (expanded ignored directories, an open ignored file): their
@@ -152,13 +176,37 @@ impl Watch {
 struct Kept {
     shown: BTreeSet<String>,
     refs: BTreeSet<String>,
+    hot: BTreeSet<String>,
     visible: bool,
 }
 
 impl Default for Kept {
     fn default() -> Self {
-        Self { shown: BTreeSet::new(), refs: BTreeSet::new(), visible: true }
+        let none = BTreeSet::new;
+        Self { shown: none(), refs: none(), hot: hot_folders([]), visible: true }
     }
+}
+
+/// The worktree root, each changed file's folder, then their parents, up to [`HOT_CAP`].
+fn hot_folders<'a>(files: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
+    let mut hot = BTreeSet::from([String::new()]);
+    let mut parents = BTreeSet::new();
+    for file in files {
+        if hot.len() >= HOT_CAP {
+            break;
+        }
+        let Some((mut dir, _)) = file.rsplit_once('/') else { continue };
+        hot.insert(dir.to_string());
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            parents.insert(parent.to_string());
+            dir = parent;
+        }
+    }
+    let room = HOT_CAP.saturating_sub(hot.len());
+    let parents: Vec<String> =
+        parents.into_iter().filter(|p| !hot.contains(p)).take(room).collect();
+    hot.extend(parents);
+    hot
 }
 
 /// How one watching stretch ended.
@@ -233,7 +281,8 @@ impl Thread {
                 Msg::Shown(shown) => self.kept.shown = shown,
                 Msg::Refs(refs) => self.kept.refs = refs,
                 Msg::Visible(visible) => self.kept.visible = visible,
-                Msg::Raw(..) => {}
+                Msg::Hot(hot) => self.kept.hot = hot,
+                Msg::Raw(..) | Msg::Ask => {}
             }
         }
     }
@@ -264,8 +313,14 @@ impl Thread {
             excludes: excludes.map(|e| canonical_beside(&e)),
             root,
         };
+        // Where the repo runs git's fsmonitor daemon, it reports the tree, and only git's files are watched.
+        let mut daemon =
+            layout.git.as_ref().and_then(|(dir, _)| Fsmonitor::locate(&layout.root, dir));
+        if daemon.is_some() {
+            logln!("watch: the tree through git's fsmonitor daemon");
+        }
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-        let (mut watcher, placed) = match start_watcher(&layout, &self.raw) {
+        let (mut watcher, placed) = match start_watcher(&layout, &self.raw, daemon.is_none()) {
             Ok(started) => started,
             Err(reason) => return Ended::Failed { reason, retry: true },
         };
@@ -309,6 +364,12 @@ impl Thread {
         }
         let mut pending: Vec<(Instant, Event)> = Vec::new();
         let mut deadline: Option<Instant> = None;
+        // The daemon is asked when an event says the tree may have moved, never on a clock.
+        let mut ask = false;
+        #[cfg(target_os = "linux")]
+        if daemon.is_some() {
+            state.watches.heat(&mut watcher, &state.layout.root, &self.kept.hot);
+        }
         loop {
             let msg = match deadline {
                 None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -319,7 +380,20 @@ impl Thread {
                 Ok(Msg::Raw(_, Ok(event))) if matches!(event.kind, EventKind::Access(_)) => {}
                 Ok(Msg::Raw(at, Ok(event))) => {
                     pending.push((at, event));
+                    ask = daemon.is_some();
                     deadline.get_or_insert_with(|| Instant::now() + GATHER);
+                }
+                Ok(Msg::Ask) if daemon.is_some() => {
+                    ask = true;
+                    deadline.get_or_insert_with(|| Instant::now() + GATHER);
+                }
+                Ok(Msg::Ask) => {}
+                Ok(Msg::Hot(hot)) => {
+                    #[cfg(target_os = "linux")]
+                    if daemon.is_some() {
+                        state.watches.heat(&mut watcher, &state.layout.root, &hot);
+                    }
+                    self.kept.hot = hot;
                 }
                 Ok(Msg::Raw(_, Err(e))) => {
                     return Ended::Failed { reason: e.to_string(), retry: true };
@@ -344,9 +418,29 @@ impl Thread {
                     self.kept.shown = shown;
                 }
                 Ok(Msg::Refs(refs)) => self.kept.refs = refs,
-                Ok(Msg::Visible(visible)) => self.kept.visible = visible,
+                Ok(Msg::Visible(visible)) => {
+                    // Shown again, the daemon is asked for what changed while hidden.
+                    if visible && !self.kept.visible && daemon.is_some() {
+                        ask = true;
+                        deadline.get_or_insert_with(Instant::now);
+                    }
+                    self.kept.visible = visible;
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     deadline = None;
+                    if let Some(daemon) = daemon.as_mut().filter(|_| std::mem::take(&mut ask)) {
+                        match daemon.query() {
+                            Ok(changes) => {
+                                let now = Instant::now();
+                                let events = daemon_events(&state.layout.root, changes);
+                                pending.extend(events.into_iter().map(|e| (now, e)));
+                            }
+                            Err(e) => {
+                                let reason = format!("git's fsmonitor daemon: {e}");
+                                return Ended::Failed { reason, retry: true };
+                            }
+                        }
+                    }
                     let events = std::mem::take(&mut pending);
                     let mut failed = None;
                     let (batch, wrote) =
@@ -365,6 +459,24 @@ impl Thread {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return Ended::Stop,
             }
         }
+    }
+}
+
+/// The daemon's answer as the events a batch reads: each path as a creation, since the daemon
+/// does not say which, and everything as lost events.
+fn daemon_events(root: &Path, changes: Changes) -> Vec<Event> {
+    match changes {
+        Changes::Everything => {
+            vec![Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)]
+        }
+        Changes::Paths(paths) => paths
+            .iter()
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                Event::new(EventKind::Create(notify::event::CreateKind::Any)).add_path(root.join(p))
+            })
+            .collect(),
     }
 }
 
@@ -582,6 +694,7 @@ type Placed = ();
 fn start_watcher(
     layout: &Layout,
     raw: &mpsc::Sender<Msg>,
+    tree: bool,
 ) -> Result<(notify::RecommendedWatcher, Placed), String> {
     let mut last = String::new();
     for attempt in 0..START_ATTEMPTS {
@@ -589,13 +702,16 @@ fn start_watcher(
             std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
         }
         let raw = raw.clone();
-        let config = notify::Config::default().with_fsevent_latency(GATHER);
+        // No reads: each would wake the thread only to be dropped.
+        let config = notify::Config::default()
+            .with_fsevent_latency(GATHER)
+            .with_event_kinds(notify::EventKindMask::CORE);
         let started = notify::RecommendedWatcher::new(
             move |event| drop(raw.send(Msg::Raw(Instant::now(), event))),
             config,
         )
         .and_then(|mut watcher| {
-            place_watches(&mut watcher, layout).map(|placed| (watcher, placed))
+            place_watches(&mut watcher, layout, tree).map(|placed| (watcher, placed))
         });
         match started {
             Ok(watcher) => return Ok(watcher),
@@ -676,7 +792,7 @@ impl State {
             self.ignored.clear();
         }
         #[cfg(target_os = "linux")]
-        if batch.git.contains(&GitChange::Index) {
+        if self.watches.tree && batch.git.contains(&GitChange::Index) {
             linux::watch_tracked(watcher, &self.layout.root, failed);
         }
         self.query_ignored(paths.iter().map(|(p, ..)| p.as_str()));
@@ -1021,13 +1137,15 @@ fn named(path: &str, name: &str) -> bool {
 fn place_watches(
     watcher: &mut notify::RecommendedWatcher,
     layout: &Layout,
+    tree: bool,
 ) -> notify::Result<Placed> {
     #[cfg(target_os = "linux")]
     {
-        linux::place(watcher, layout)
+        linux::place(watcher, layout, tree)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = tree;
         // One batch: `FSEvents` restarts its stream on every change of paths, losing writes meanwhile.
         let ops = |outside: bool| {
             let mut ops = vec![notify::PathOp::watch_recursive(&layout.root)];
@@ -1122,6 +1240,10 @@ mod linux {
     #[derive(Debug, Default)]
     pub(crate) struct Watches {
         walked: BTreeSet<PathBuf>,
+        /// Whether the tree is watched here; `false` while git's fsmonitor daemon reports it.
+        pub(super) tree: bool,
+        /// The changed folders watched beside the daemon.
+        hot: BTreeSet<PathBuf>,
     }
 
     /// Watch `dir`; a watch refused for lack of inotify watches fails the watcher (`failed`), so
@@ -1153,10 +1275,12 @@ mod linux {
     pub(super) fn place(
         watcher: &mut notify::RecommendedWatcher,
         layout: &Layout,
+        tree: bool,
     ) -> notify::Result<Watches> {
         let mut failed = None;
         let mut walked = BTreeSet::new();
-        for dir in walk_dirs(&layout.root) {
+        let walk = tree.then(|| walk_dirs(&layout.root));
+        for dir in walk.into_iter().flatten() {
             if watch(watcher, &dir, &mut failed) {
                 walked.insert(dir);
             }
@@ -1178,10 +1302,12 @@ mod linux {
             }
         }
         super::watch_outside(watcher, layout)?;
-        watch_tracked(watcher, &layout.root, &mut failed);
+        if tree {
+            watch_tracked(watcher, &layout.root, &mut failed);
+        }
         match failed {
             Some(reason) => Err(notify::Error::generic(&reason)),
-            None => Ok(Watches { walked }),
+            None => Ok(Watches { walked, tree, hot: BTreeSet::new() }),
         }
     }
 
@@ -1208,6 +1334,9 @@ mod linux {
             shown: &BTreeSet<String>,
             failed: &mut Option<String>,
         ) {
+            if !self.tree {
+                return;
+            }
             let now: BTreeSet<PathBuf> = walk_dirs(&layout.root).collect();
             let on_screen = |dir: &Path| shown.iter().any(|s| layout.root.join(s) == dir);
             for gone in self.walked.difference(&now).filter(|d| !on_screen(d)) {
@@ -1235,7 +1364,7 @@ mod linux {
             failed: &mut Option<String>,
         ) -> Vec<String> {
             let dir = layout.root.join(rel);
-            if !dir.is_dir() {
+            if !self.tree || !dir.is_dir() {
                 return Vec::new();
             }
             let mut found = Vec::new();
@@ -1251,6 +1380,26 @@ mod linux {
             found
         }
 
+        /// Watch the changed folders `hot` beside the daemon, and drop the ones no longer changed.
+        /// A refused watch is skipped: the daemon still answers at the next event.
+        pub(super) fn heat(
+            &mut self,
+            watcher: &mut notify::RecommendedWatcher,
+            root: &Path,
+            hot: &BTreeSet<String>,
+        ) {
+            let at =
+                |dir: &String| if dir.is_empty() { root.to_path_buf() } else { root.join(dir) };
+            let want: BTreeSet<PathBuf> = hot.iter().map(at).collect();
+            for gone in self.hot.difference(&want) {
+                let _ = watcher.unwatch(gone);
+            }
+            for dir in want.difference(&self.hot) {
+                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            }
+            self.hot = want;
+        }
+
         /// Watch newly shown ignored directories, and drop the watches of ones no longer shown.
         pub(super) fn show(
             &self,
@@ -1260,6 +1409,10 @@ mod linux {
             new: &BTreeSet<String>,
             failed: &mut Option<String>,
         ) {
+            // The daemon reports ignored folders too.
+            if !self.tree {
+                return;
+            }
             // An unshown folder's watch goes unless the walk placed it; an unshown file's stays.
             let gone = old.difference(new).map(|g| root.join(g)).filter(|g| !g.is_file());
             for gone in gone.filter(|g| !self.walked.contains(g)) {
@@ -1326,7 +1479,19 @@ fn remote_filesystem(_: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Class, GitChange, Layout, classify, ref_matters};
+    use super::{Class, GitChange, HOT_CAP, Layout, classify, hot_folders, ref_matters};
+
+    #[test]
+    fn hot_folders_are_the_root_each_files_folder_then_parents_up_to_the_cap() {
+        let hot = hot_folders(["top.rs", "a/b/c.rs", "a/d.rs"]);
+        let hot: Vec<&str> = hot.iter().map(String::as_str).collect();
+        assert_eq!(hot, ["", "a", "a/b"]);
+        // Past the cap, files' own folders come before parents.
+        let files: Vec<String> = (0..150).map(|i| format!("p/q{i}/f.rs")).collect();
+        let hot = hot_folders(files.iter().map(String::as_str));
+        assert_eq!(hot.len(), HOT_CAP);
+        assert!(!hot.contains("p"), "a parent waits for room");
+    }
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 

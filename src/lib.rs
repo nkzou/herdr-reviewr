@@ -10,6 +10,7 @@ pub mod editor;
 pub mod export;
 pub mod file_list;
 pub mod forge;
+mod fsmonitor;
 pub mod git;
 pub mod gitlab;
 pub mod herdr;
@@ -1038,6 +1039,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             let mut heard = false;
             let mut moved = shown_by_input.take();
             while let Ok(event) = herdr_rx.try_recv() {
+                // A turn that moved may have written: git's fsmonitor daemon is asked.
+                if matches!(event, crate::herdr_socket::HerdrEvent::Turn(_)) {
+                    watch.ask();
+                }
                 let landed = land_herdr_event(app, event);
                 moved = landed.visible.or(moved);
                 // A new baseline rebuilds `last-turn` like a watcher batch.
@@ -1058,6 +1063,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             // What the screen shows beyond the watcher's defaults: ignored entries, a local base.
             watch.show(app.shown_ignored());
             watch.set_refs(app.watched_refs());
+            watch.set_changed(app.changed_paths());
             if heard {
                 continue;
             }
@@ -1342,6 +1348,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 }
                 match event {
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        // The reviewer is looking: git's fsmonitor daemon is asked what changed.
+                        watch.ask();
                         if let Err(e) = handle_key(app, k, area, painted_frame.keymap()) {
                             app.status = format!("error: {e}");
                         }
@@ -1364,6 +1372,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                         );
                     }
                     Event::Mouse(m) => {
+                        if matches!(m.kind, MouseEventKind::Down(_)) {
+                            watch.ask();
+                        }
                         last_mouse = Instant::now();
                         // This frame's heights, so a drag never re-measures the diff.
                         if let Err(e) =
